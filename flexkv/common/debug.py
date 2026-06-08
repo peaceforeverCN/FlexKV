@@ -104,6 +104,136 @@ class FlexkvLogger:
 flexkv_logger = FlexkvLogger(os.getenv("FLEXKV_LOG_LEVEL", "INFO"))
 
 
+def format_process_exit(exitcode: Optional[int]) -> str:
+    if exitcode is None:
+        return "running"
+    if exitcode < 0:
+        sig = -exitcode
+        try:
+            sig_name = signal.Signals(sig).name
+        except ValueError:
+            sig_name = f"SIG{sig}"
+        return f"signal {sig} ({sig_name})"
+    return f"exit {exitcode}"
+
+
+def summarize_id_tensor(
+    name: str,
+    ids: Union[torch.Tensor, np.ndarray],
+) -> str:
+    if isinstance(ids, torch.Tensor):
+        arr = ids.detach().cpu().numpy()
+    else:
+        arr = np.asarray(ids)
+    if arr.size == 0:
+        return f"{name}: empty"
+    return (
+        f"{name}: count={arr.size}, min={int(arr.min())}, max={int(arr.max())}, "
+        f"dtype={arr.dtype}"
+    )
+
+
+def install_worker_crash_diagnostics(worker_class_name: str, worker_id: int) -> None:
+    """Best-effort crash breadcrumbs inside FlexKV transfer worker subprocesses."""
+    import faulthandler
+
+    flexkv_logger.info(
+        "[FlexKV-SEGV-DEBUG] install_worker_crash_diagnostics: "
+        f"class={worker_class_name}, worker_id={worker_id}, pid={os.getpid()}"
+    )
+    try:
+        faulthandler.enable(all_threads=True, file=sys.stderr)
+    except Exception as e:
+        flexkv_logger.warning(
+            f"[FlexKV-SEGV-DEBUG] faulthandler.enable failed pid={os.getpid()}: {e}"
+        )
+
+    def _fatal_signal_handler(signum: int, frame: Any) -> None:
+        try:
+            sig_name = signal.Signals(signum).name
+        except ValueError:
+            sig_name = f"SIG{signum}"
+        flexkv_logger.critical(
+            "[FlexKV-SEGV-DEBUG] worker fatal signal: "
+            f"class={worker_class_name}, worker_id={worker_id}, pid={os.getpid()}, "
+            f"signum={signum} ({sig_name})"
+        )
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS, signal.SIGFPE):
+        try:
+            signal.signal(sig, _fatal_signal_handler)
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+
+def maybe_dump_transfer_block_ids(
+    op_id: int,
+    transfer_type: str,
+    gpu_block_ids: Union[torch.Tensor, np.ndarray],
+    cpu_block_ids: Union[torch.Tensor, np.ndarray],
+    group_idx: Optional[int] = None,
+) -> None:
+    """Dump full block-id lists for hang post-mortem when FLEXKV_DUMP_D2H_BLOCK_IDS=1."""
+    if os.getenv("FLEXKV_DUMP_D2H_BLOCK_IDS", "0") not in ("1", "true", "TRUE"):
+        return
+    dump_dir = os.getenv(
+        "FLEXKV_DUMP_DIR", "/cfs_zhongwei/leolingli/dsv4/log/flexkv_dumps"
+    )
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        if isinstance(gpu_block_ids, torch.Tensor):
+            gpu_arr = gpu_block_ids.detach().cpu().numpy()
+        else:
+            gpu_arr = np.asarray(gpu_block_ids)
+        if isinstance(cpu_block_ids, torch.Tensor):
+            cpu_arr = cpu_block_ids.detach().cpu().numpy()
+        else:
+            cpu_arr = np.asarray(cpu_block_ids)
+        suffix = f"_g{group_idx}" if group_idx is not None else ""
+        path = os.path.join(
+            dump_dir,
+            f"op{op_id}_{transfer_type}{suffix}_pid{os.getpid()}.npz",
+        )
+        np.savez(path, gpu_block_ids=gpu_arr, cpu_block_ids=cpu_arr)
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] dumped block ids: path=%s, gpu_count=%d, cpu_count=%d",
+            path,
+            gpu_arr.size,
+            cpu_arr.size,
+        )
+    except Exception as e:
+        flexkv_logger.warning(
+            "[FlexKV-SEGV-DEBUG] dump block ids failed op_id=%s: %s", op_id, e
+        )
+
+
+def summarize_block_ids_from_slots(
+    slot_mapping: Union[torch.Tensor, np.ndarray],
+    tokens_per_block: int,
+) -> Dict[str, int]:
+    if isinstance(slot_mapping, torch.Tensor):
+        slots = slot_mapping.detach().cpu().numpy()
+    else:
+        slots = np.asarray(slot_mapping)
+    if slots.size == 0 or tokens_per_block <= 0:
+        return {"slot_count": int(slots.size), "block_count": 0}
+    block_ids = slots[::tokens_per_block] // tokens_per_block
+    return {
+        "slot_count": int(slots.size),
+        "slot_min": int(slots.min()),
+        "slot_max": int(slots.max()),
+        "block_count": int(block_ids.size),
+        "block_min": int(block_ids.min()),
+        "block_max": int(block_ids.max()),
+    }
+
+
 def debug_timing(name: Optional[str] = None) -> Callable:
     def decorator(func: Callable) -> Callable:
         @wraps(func)
