@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import ctypes
+import weakref
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import torch
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.gpu_backend import current_backend as _gpu_backend
-from flexkv.storage.allocator import alloc_hugepage_tensor, free_hugepage_tensor
+from flexkv.storage.allocator import (
+    DEFAULT_HUGE_PAGE_SIZE,
+    alloc_hugepage_tensor,
+    free_hugepage_tensor,
+)
 
 
 def cuda_host_registration_available() -> bool:
@@ -21,6 +28,13 @@ def cuda_host_registration_available() -> bool:
         return _gpu_backend.is_available()
     except Exception:
         return False
+
+
+# Portable + Mapped: required for custom D2H kernels that store into host pointers.
+CUDA_HOST_REGISTER_PORTABLE = 0x01
+CUDA_HOST_REGISTER_MAPPED = 0x02
+CUDA_HOST_ALLOC_PORTABLE = 0x01
+CUDA_HOST_ALLOC_MAPPED = 0x02
 
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
@@ -74,15 +88,59 @@ class HostBufferHandle:
         self.is_hugepage = False
 
 
-def _allocate_pinned_cpu_tensor(num_elements: int, dtype: torch.dtype) -> HostBufferHandle:
-    return HostBufferHandle.pinned(
-        torch.empty(
-            num_elements,
-            dtype=dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
+    """cudaHostAlloc(PORTABLE|MAPPED) buffer writable from device kernels."""
+    cudart = _get_cudart()
+    num_bytes = num_elements * dtype.itemsize
+    host_ptr = ctypes.c_void_p()
+    flags = CUDA_HOST_ALLOC_PORTABLE | CUDA_HOST_ALLOC_MAPPED
+    err = cudart.cudaHostAlloc(
+        ctypes.byref(host_ptr),
+        ctypes.c_size_t(num_bytes),
+        ctypes.c_uint(flags),
     )
+    if err != 0:
+        raise RuntimeError(f"cudaHostAlloc(mapped) failed with error code {err}")
+
+    buf_type = ctypes.c_uint8 * num_bytes
+    raw = buf_type.from_address(host_ptr.value)
+    np_arr = np.frombuffer(raw, dtype=np.uint8, count=num_bytes)
+    tensor = (
+        torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes)
+        .view(dtype)[:num_elements]
+    )
+    weakref.finalize(tensor, lambda p=host_ptr: cudart.cudaFreeHost(p))
+    return tensor
+
+
+def alloc_kernel_visible_cpu_tensor(
+    num_elements: int,
+    dtype: torch.dtype,
+    *,
+    hugepage_size_bytes: int = DEFAULT_HUGE_PAGE_SIZE,
+) -> torch.Tensor:
+    """CPU tensor accessible to custom GPU D2H kernels (hugepage or mapped alloc)."""
+    hugepage_buf = None
+    try:
+        hugepage_buf = alloc_hugepage_tensor(
+            num_elements=num_elements,
+            dtype=dtype,
+            page_size_bytes=hugepage_size_bytes,
+        )
+        cudaHostRegister(hugepage_buf)
+        return hugepage_buf
+    except Exception as e:
+        if hugepage_buf is not None:
+            free_hugepage_tensor(hugepage_buf)
+        flexkv_logger.warning(
+            f"[host_buffer] hugepage unavailable for kernel-visible CPU buffer ({e}); "
+            "using cudaHostAlloc(MAPPED)"
+        )
+        return alloc_mapped_host_tensor(num_elements, dtype)
+
+
+def _allocate_pinned_cpu_tensor(num_elements: int, dtype: torch.dtype) -> HostBufferHandle:
+    return HostBufferHandle.pinned(alloc_mapped_host_tensor(num_elements, dtype))
 
 
 def _fallback_to_pinned(
