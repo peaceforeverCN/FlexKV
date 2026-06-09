@@ -571,8 +571,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     gp['cpu_layer_stride'],
                     gp['cpu_block_stride'],
                     gp['chunk_size'],
-                    0,                   # start_layer_id (always 0 within group)
-                    gp['num_layers'],    # all layers in this group
+                    gp['num_layers'],
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
@@ -593,8 +592,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.cpu_layer_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 self.chunk_size_in_bytes,
-                0,                  # start_layer_id (whole-model)
-                self.num_layers,    # layer_granularity = all layers
+                self.num_layers,
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
                 use_ce_transfer,
