@@ -88,19 +88,31 @@ class HostBufferHandle:
         self.is_hugepage = False
 
 
+def _get_host_alloc_api() -> tuple[object, str, str]:
+    if hasattr(_gpu_backend, "cudart"):
+        return _gpu_backend.cudart, "cudaHostAlloc", "cudaFreeHost"
+    if hasattr(_gpu_backend, "hipart"):
+        return _gpu_backend.hipart, "hipHostMalloc", "hipHostFree"
+    raise RuntimeError(
+        f"mapped host allocation is not supported on backend {type(_gpu_backend).__name__}"
+    )
+
+
 def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
-    """cudaHostAlloc(PORTABLE|MAPPED) buffer writable from device kernels."""
-    cudart = _get_cudart()
+    """Allocate PORTABLE|MAPPED host memory writable from device kernels."""
+    runtime, alloc_name, free_name = _get_host_alloc_api()
+    host_alloc = getattr(runtime, alloc_name)
+    host_free = getattr(runtime, free_name)
     num_bytes = num_elements * dtype.itemsize
     host_ptr = ctypes.c_void_p()
     flags = CUDA_HOST_ALLOC_PORTABLE | CUDA_HOST_ALLOC_MAPPED
-    err = cudart.cudaHostAlloc(
+    err = host_alloc(
         ctypes.byref(host_ptr),
         ctypes.c_size_t(num_bytes),
         ctypes.c_uint(flags),
     )
     if err != 0:
-        raise RuntimeError(f"cudaHostAlloc(mapped) failed with error code {err}")
+        raise RuntimeError(f"{alloc_name}(mapped) failed with error code {err}")
 
     buf_type = ctypes.c_uint8 * num_bytes
     raw = buf_type.from_address(host_ptr.value)
@@ -109,7 +121,7 @@ def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Ten
         torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes)
         .view(dtype)[:num_elements]
     )
-    weakref.finalize(tensor, lambda p=host_ptr: cudart.cudaFreeHost(p))
+    weakref.finalize(tensor, lambda p=host_ptr: host_free(p))
     return tensor
 
 
