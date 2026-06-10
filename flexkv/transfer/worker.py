@@ -28,7 +28,7 @@ except ImportError:
     transfer_kv_blocks_gds = None
     TPGDSTransferThreadGroup = None
 
-from flexkv.common.debug import flexkv_logger
+from flexkv.common.debug import flexkv_logger, summarize_id_tensor
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
