@@ -21,6 +21,8 @@
  */
 #include <torch/extension.h>
 
+#include <cstdlib>
+
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
 
@@ -125,11 +127,47 @@ void transfer_kv_blocks(
   // CE transfer mode (Copy Engine using gpuMemcpyAsync)
   if (use_ce_transfer) {
     int kv_dim = is_mla ? 1 : 2;
+
+    // ---- CE copy-coalescing optimization (ROCm hot-path) --------------------
+    // Baseline issues one gpuMemcpyAsync per (layer x kv x block), which on
+    // ROCm degenerates into tens of thousands of tiny submissions and becomes
+    // launch-bound. We coalesce, within each (layer, kv), maximal runs of
+    // blocks whose CPU *and* GPU block ids are both consecutive (step +1):
+    //   - §5.1 (mode bit 0): if both sides are gap-less
+    //     (chunk_size == block_stride) the run is physically contiguous, so a
+    //     single 1D gpuMemcpyAsync of run_len*chunk replaces run_len copies.
+    //   - §5.2 (mode bit 1): otherwise the run is regularly strided, so a
+    //     single strided gpuMemcpy2DAsync (width=chunk, height=run_len,
+    //     pitch=block_stride) replaces run_len copies and also handles gaps.
+    // Controlled by FLEXKV_CE_COALESCE (0=baseline, 1=§5.1 only, 2=§5.2 only,
+    // 3=both, default 3) so A/B comparisons stay exact.
+    static const int ce_coalesce_mode = []() {
+      const char *e = std::getenv("FLEXKV_CE_COALESCE");
+      return e ? std::atoi(e) : 3;
+    }();
+    const int64_t gpu_block_stride_int64 = gpu_tensor_handler.gpu_block_stride;
+    const bool gapless_1d =
+        (chunk_size_in_int64 == gpu_block_stride_int64) &&
+        (chunk_size_in_int64 == cpu_block_stride_int64);
+    const int64_t gpu_block_stride_bytes =
+        gpu_block_stride_int64 * static_cast<int64_t>(sizeof(int64_t));
+
     for (int i = 0; i < num_layers; i++) {
       for (int j = 0; j < kv_dim; j++) {
-        for (int k = 0; k < num_blocks; k++) {
-          int64_t gpu_block_idx = gpu_block_ids[k];
-          int64_t cpu_block_idx = cpu_block_ids[k];
+        int k = 0;
+        while (k < num_blocks) {
+          const int64_t gpu_block_idx = gpu_block_ids[k];
+          const int64_t cpu_block_idx = cpu_block_ids[k];
+
+          // Find maximal run [k, k+run_len) with both id streams stepping +1.
+          int run_len = 1;
+          if (ce_coalesce_mode != 0) {
+            while (k + run_len < num_blocks &&
+                   gpu_block_ids[k + run_len] == gpu_block_idx + run_len &&
+                   cpu_block_ids[k + run_len] == cpu_block_idx + run_len) {
+              ++run_len;
+            }
+          }
 
           int64_t *cpu_chunk_ptr =
               cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
@@ -141,19 +179,61 @@ void transfer_kv_blocks(
           int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
                                    gpu_startoff_inside_chunks_int64;
 
-          if (is_host_to_device) {
-            gpuMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, chunk_size_in_bytes,
-                           gpuMemcpyHostToDevice, stream);
+          const bool use_1d = (ce_coalesce_mode & 1) && run_len > 1 && gapless_1d;
+          const bool use_2d = (ce_coalesce_mode & 2) && run_len > 1 && !use_1d;
+
+          if (use_1d) {
+            // §5.1: one contiguous copy for the whole run.
+            int64_t run_bytes = chunk_size_in_bytes * run_len;
+            if (is_host_to_device) {
+              gpuMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, run_bytes,
+                             gpuMemcpyHostToDevice, stream);
+            } else {
+              gpuMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, run_bytes,
+                             gpuMemcpyDeviceToHost, stream);
+            }
+            FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, run_bytes);
+          } else if (use_2d) {
+            // §5.2: one strided 2D copy for the whole run.
+            if (is_host_to_device) {
+              gpuMemcpy2DAsync(gpu_chunk_ptr, gpu_block_stride_bytes,
+                               cpu_chunk_ptr, cpu_block_stride_in_bytes,
+                               chunk_size_in_bytes, run_len,
+                               gpuMemcpyHostToDevice, stream);
+            } else {
+              gpuMemcpy2DAsync(cpu_chunk_ptr, cpu_block_stride_in_bytes,
+                               gpu_chunk_ptr, gpu_block_stride_bytes,
+                               chunk_size_in_bytes, run_len,
+                               gpuMemcpyDeviceToHost, stream);
+            }
+            FLEXKV_GPU_CPU_TRANSFER(is_host_to_device,
+                                    chunk_size_in_bytes * run_len);
           } else {
-            gpuMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, chunk_size_in_bytes,
-                           gpuMemcpyDeviceToHost, stream);
+            // Baseline / run_len==1: per-block copies.
+            for (int t = 0; t < run_len; ++t) {
+              int64_t gb = gpu_block_ids[k + t];
+              int64_t cb = cpu_block_ids[k + t];
+              int64_t *cpu_t =
+                  cpu_ptr_int64 +
+                  (i + start_layer_id) * cpu_layer_stride_int64 +
+                  j * cpu_kv_stride_int64 + cb * cpu_block_stride_int64 +
+                  cpu_startoff_inside_chunks_int64;
+              int64_t *gpu_t = reinterpret_cast<int64_t *>(ptr_at<Type>(
+                                   gpu_tensor_handler, i + start_layer_id, j,
+                                   gb)) +
+                               gpu_startoff_inside_chunks_int64;
+              if (is_host_to_device) {
+                gpuMemcpyAsync(gpu_t, cpu_t, chunk_size_in_bytes,
+                               gpuMemcpyHostToDevice, stream);
+              } else {
+                gpuMemcpyAsync(cpu_t, gpu_t, chunk_size_in_bytes,
+                               gpuMemcpyDeviceToHost, stream);
+              }
+              FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes);
+            }
           }
-          // Record transfer metrics after each gpuMemcpyAsync submission.
-          // Direction convention (from GPU perspective):
-          //   - is_host_to_device=true  -> read (CPU->GPU, data flows INTO GPU)
-          //   - is_host_to_device=false -> write (GPU->CPU, data flows OUT of
-          //   GPU)
-          FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes);
+
+          k += run_len;
         }
       }
     }

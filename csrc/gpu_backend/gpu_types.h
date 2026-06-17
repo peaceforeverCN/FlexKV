@@ -28,6 +28,7 @@
   #define gpuStreamDestroy   cudaStreamDestroy
   #define gpuStreamSynchronize cudaStreamSynchronize
   #define gpuMemcpyAsync     cudaMemcpyAsync
+  #define gpuMemcpy2DAsync   cudaMemcpy2DAsync
   #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
   #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
   #define gpuMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
@@ -49,6 +50,7 @@
   #define gpuStreamDestroy   hipStreamDestroy
   #define gpuStreamSynchronize hipStreamSynchronize
   #define gpuMemcpyAsync     hipMemcpyAsync
+  #define gpuMemcpy2DAsync   hipMemcpy2DAsync
   #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
   #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
   #define gpuMemcpyDeviceToDevice hipMemcpyDeviceToDevice
@@ -70,6 +72,7 @@
   #define gpuStreamDestroy   musaStreamDestroy
   #define gpuStreamSynchronize musaStreamSynchronize
   #define gpuMemcpyAsync     musaMemcpyAsync
+  #define gpuMemcpy2DAsync   musaMemcpy2DAsync
   #define gpuMemcpyHostToDevice musaMemcpyHostToDevice
   #define gpuMemcpyDeviceToHost musaMemcpyDeviceToHost
   #define gpuMemcpyDeviceToDevice musaMemcpyDeviceToDevice
