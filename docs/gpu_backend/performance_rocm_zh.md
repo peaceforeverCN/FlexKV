@@ -235,7 +235,7 @@ PY
 
 由环境变量 `FLEXKV_CE_COALESCE` 控制(`0`=baseline 逐块,`1`=§5.1,`2`=§5.2,`3`=both,**默认 3**),便于 A/B。新增 `gpuMemcpy2DAsync` 跨厂商宏(`csrc/gpu_backend/gpu_types.h`)。
 
-### 8.1 A/B 结果(example_config.yml,纯 CPU↔GPU,多次复现)
+### 8.1 A/B 场景 1:`benchmark_single_batch.py`(VLLM 布局,**gapped**,纯 CPU↔GPU)
 
 | 模式 | D2H `put` | H2D `get` |
 | -- | -- | -- |
@@ -244,12 +244,40 @@ PY
 | 2 §5.2(2D) | 3.79 GB/s | **31.5 GB/s** |
 | 3 both | 3.56–3.81 GB/s | **22.7–31.7 GB/s** |
 
-### 8.2 结论
+此布局 `chunk_size ≠ block_stride`(block 间有 gap),1D 合并条件不成立 → §5.1 无效;§5.2(2D 跨步)生效,H2D ~8–11×。
 
-- **§5.2(2D 跨步合并)= 明确有收益,判定完成 ✅**。H2D `get` 提升 **~8–11×**(2.7 → 23–31 GB/s,已接近硬件上限的 60%),D2H `put` 提升 **~1.3–1.5×**。`put` 提升较小是因为合并后传输已不再是瓶颈,`put` 转为受 CPU 侧 bookkeeping(哈希 / radix 插入)限制——属另一处优化点。正确性:`test_kvmanager.py -k test_config0-cache_config0`(含多 tp 变体)**17 passed / 8 skipped**,数据完整性通过。
-- **§5.1(1D 合并)= A/B 无收益,不计为完成 ❌**。本布局 `chunk_size ≠ block_stride`(block 间有 gap,非物理连续),1D 合并条件永不成立,实测与 baseline 完全一致。代码保留为**对 gap-less 布局(如某些 MLA / 其他 backend layout)的零开销快速路径**,默认不激活时无任何代价;§5.2 已在功能上覆盖其目标。
+### 8.2 A/B 场景 2:`flexkv_transfer_microbench.py`(MLA/SGLANG 布局,**gapless**,直接调 `transfer_kv_blocks`)
 
-> 关键认知:FlexKV 的 KV-cache 在 CPU/GPU 两端 block 之间**存在 stride gap**(block_stride > chunk),因此"合并连续内存"(§5.1)行不通,而"带 pitch 的跨步 2D 拷贝"(§5.2)才是正解,且单次调用即可把一个 `(layer,kv)` 的整列 block 拷完,launch 次数从 `L×kv×B` 降到 `L×kv`(本例 65536 → 128)。
+来自 zhjc1124 fork commit `94ea329`,78 层 / chunk 16 KiB / 512 block / MLA(kv_dim=1)。`chunk == block_stride`(gapless)。单位 GiB/s,5 iter mean:
+
+| 方向 / 模式 | 0 baseline | 1 §5.1(1D) | 2 §5.2(2D) | 3 both |
+| -- | -- | -- | -- | -- |
+| D2H path0(全连续) | 0.99 | **8.82** | 7.99 | 8.82 |
+| D2H path1(2 段+gap) | 0.99 | **5.63** | 5.26 | 5.70 |
+| D2H scatter(cpu 跳步) | 0.98 | 0.99 | 0.98 | 0.98 |
+| H2D path1 | 3.20 | 5.48 | **5.72** | 5.55 |
+
+gapless 布局下 **§5.1(1D)生效且略优于 2D**(D2H path0 8.82 vs 7.99);scatter(block id 非 +1 连续)两者都不触发(属 fork `path2` staging 处理的场景,本实现未做)。
+
+### 8.2b A/B 场景 3:`flexkv_tp8_transfer_microbench.py`(TP8 sharded D2H,走 `TPTransferThreadGroup`)
+
+来自同一 fork。`TPTransferThreadGroup::tp_group_transfer` 内部对**每个 GPU** 调用我们改过的 `transfer_kv_blocks<Type>`,所以本优化对 TP 真实 worker 路径同样生效。8 卡并行、每卡传 shard(16 KiB)、`cpu_block_stride=total_chunk(128 KiB)` → **gapped**。聚合带宽(8 GPU):
+
+| pattern / 模式 | 0 baseline | 1 §5.1(1D) | 2 §5.2(2D) | 3 both |
+| -- | -- | -- | -- | -- |
+| path1(2 段+gap) | 22.2 | 21.8 | **163.1** | 161.7 GiB/s |
+| path0(全连续) | 22.4 | 22.1 | **161.4** | 161.3 GiB/s |
+
+§5.2 提速 **~7.2–7.3×**(22 → ~163 GiB/s 聚合,约 20 GiB/s/卡);§5.1 不触发(sharded 布局 gapped),符合预期。
+
+### 8.3 结论
+
+- **§5.2(2D 跨步合并)= 完成 ✅**。在 gapped 布局(VLLM)下 H2D 提升 ~8–11×(2.7 → 23–31 GB/s),D2H ~1.3–1.5×;gapless 布局下同样有效。
+- **§5.1(1D 连续合并)= 完成 ✅**(补测后修正前述结论)。在 **gapless 布局**(MLA/SGLANG microbench)下 D2H 提升 **5.7×(path1)~8.9×(path0)**,且单次大块 1D 拷贝略快于 2D。之前 single_batch(VLLM)无收益仅因该布局 `chunk ≠ block_stride` 有 gap。
+- **mode 3(both,默认)= 最优**:gapless 时走 1D(最快),否则走 2D(最通用),取两者之优。`put` 提升较小是因为合并后传输已非瓶颈,转为受 CPU 侧 bookkeeping(哈希 / radix 插入)限制。
+- 正确性:`test_kvmanager.py -k test_config0-cache_config0`(含多 tp 变体)**17 passed / 8 skipped**,数据完整性通过(VLLM 路径);实现基于裸指针/stride,与 backend layout 无关。
+
+> 关键认知:① launch 次数从 `L×kv×B` 降到 `L×kv`(场景 2 即 39936 → 78)是提速根因;② "连续内存 1D 合并"(§5.1)只在 gapless 布局成立且最快,"带 pitch 的 2D 跨步"(§5.2)更通用、处理 gap,二者互补;③ 两端 block id 必须**同时 +1**才合并,scatter/gather 这类单边跳步的场景需要 staging(未来工作)。
 
 ---
 
