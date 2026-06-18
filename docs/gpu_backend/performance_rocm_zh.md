@@ -226,7 +226,7 @@ PY
 
 ---
 
-## 8. 优化实现与 A/B 结果(2026-06-16)
+## 7. 优化实现与 A/B 结果(2026-06-16)
 
 实现位置:`csrc/gpu_backend/nvidia/transfer.cu` 的 CE transfer 分支(ROCm 编译用其 hipify 产物)。在每个 `(layer, kv)` 内检测 **CPU 与 GPU block id 同时 +1 递增的最大连续 run**,把原来 `run_len` 次逐块 `gpuMemcpyAsync` 合并为:
 
@@ -235,7 +235,7 @@ PY
 
 由环境变量 `FLEXKV_CE_COALESCE` 控制(`0`=baseline 逐块,`1`=§5.1,`2`=§5.2,`3`=both,**默认 3**),便于 A/B。新增 `gpuMemcpy2DAsync` 跨厂商宏(`csrc/gpu_backend/gpu_types.h`)。
 
-### 8.1 A/B 场景 1:`benchmark_single_batch.py`(VLLM 布局,**gapped**,纯 CPU↔GPU)
+### 7.1 A/B 场景 1:`benchmark_single_batch.py`(VLLM 布局,**gapped**,纯 CPU↔GPU)
 
 | 模式 | D2H `put` | H2D `get` |
 | -- | -- | -- |
@@ -246,7 +246,7 @@ PY
 
 此布局 `chunk_size ≠ block_stride`(block 间有 gap),1D 合并条件不成立 → §5.1 无效;§5.2(2D 跨步)生效,H2D ~8–11×。
 
-### 8.2 A/B 场景 2:`flexkv_transfer_microbench.py`(MLA/SGLANG 布局,**gapless**,直接调 `transfer_kv_blocks`)
+### 7.2 A/B 场景 2:`flexkv_transfer_microbench.py`(MLA/SGLANG 布局,**gapless**,直接调 `transfer_kv_blocks`)
 
 来自 zhjc1124 fork commit `94ea329`,78 层 / chunk 16 KiB / 512 block / MLA(kv_dim=1)。`chunk == block_stride`(gapless)。单位 GiB/s,5 iter mean:
 
@@ -259,7 +259,7 @@ PY
 
 gapless 布局下 **§5.1(1D)生效且略优于 2D**(D2H path0 8.82 vs 7.99);scatter(block id 非 +1 连续)两者都不触发(属 fork `path2` staging 处理的场景,本实现未做)。
 
-### 8.2b A/B 场景 3:`flexkv_tp8_transfer_microbench.py`(TP8 sharded D2H,走 `TPTransferThreadGroup`)
+### 7.3 A/B 场景 3:`flexkv_tp8_transfer_microbench.py`(TP8 sharded D2H,走 `TPTransferThreadGroup`)
 
 来自同一 fork。`TPTransferThreadGroup::tp_group_transfer` 内部对**每个 GPU** 调用我们改过的 `transfer_kv_blocks<Type>`,所以本优化对 TP 真实 worker 路径同样生效。8 卡并行、每卡传 shard(16 KiB)、`cpu_block_stride=total_chunk(128 KiB)` → **gapped**。聚合带宽(8 GPU):
 
@@ -270,7 +270,7 @@ gapless 布局下 **§5.1(1D)生效且略优于 2D**(D2H path0 8.82 vs 7.99);sca
 
 §5.2 提速 **~7.2–7.3×**(22 → ~163 GiB/s 聚合,约 20 GiB/s/卡);§5.1 不触发(sharded 布局 gapped),符合预期。
 
-### 8.3 结论
+### 7.4 结论
 
 - **§5.2(2D 跨步合并)= 完成 ✅**。在 gapped 布局(VLLM)下 H2D 提升 ~8–11×(2.7 → 23–31 GB/s),D2H ~1.3–1.5×;gapless 布局下同样有效。
 - **§5.1(1D 连续合并)= 完成 ✅**(补测后修正前述结论)。在 **gapless 布局**(MLA/SGLANG microbench)下 D2H 提升 **5.7×(path1)~8.9×(path0)**,且单次大块 1D 拷贝略快于 2D。之前 single_batch(VLLM)无收益仅因该布局 `chunk ≠ block_stride` 有 gap。
@@ -281,6 +281,6 @@ gapless 布局下 **§5.1(1D)生效且略优于 2D**(D2H path0 8.82 vs 7.99);sca
 
 ---
 
-## 7. 一句话总结
+## 8. 一句话总结
 
-ROCm 上 FlexKV 基线的 D2H≈2.7 / H2D≈2.7 GB/s 远低于硬件的 45–54 GB/s,**根因是 CE transfer 把一次传输拆成数万个 32KiB 小拷贝(launch-bound)**。**已落地并经 A/B 验证的优化是 §5.2(`gpuMemcpy2DAsync` 跨步合并),H2D 提升 ~8–11× 至 23–31 GB/s,D2H ~1.5×,正确性通过**(§8)。§5.1(1D 连续合并)因 FlexKV 布局存在 block stride gap 而无收益,不计完成。后续:根治方案 §5.3(ROCm kernel zero-copy),`put` 侧 bookkeeping 与多流(§5.4)可进一步提升,配置层可试 §5.7 增大 tokens_per_block。
+ROCm 上 FlexKV 基线的 D2H≈3.0 / H2D≈2.7 GB/s 远低于硬件的 45–54 GB/s,**根因是 CE transfer 把一次传输拆成数万个 32KiB 小拷贝(launch-bound)**。**已落地并经多场景 A/B 验证的优化是 §5.1(`gpuMemcpyAsync` 1D 连续合并)+ §5.2(`gpuMemcpy2DAsync` 跨步合并),默认 mode 3 自动取两者之优**(§7):VLLM gapped 布局 H2D 提升 ~8–11× 至 23–31 GB/s、D2H ~1.3–1.5×;MLA/SGLANG gapless 布局 D2H 提升 ~5.7–8.9×;TP8 sharded 聚合带宽 22 → ~163 GiB/s(~7.3×)。正确性通过 `test_kvmanager.py`。后续:根治方案 §5.3(ROCm kernel zero-copy),`put` 侧 bookkeeping 与多流(§5.4)可进一步提升,scatter/gather 场景需 staging。
