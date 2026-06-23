@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 from functools import wraps
-from typing import Optional, Callable, Any, Union
+from typing import Optional, Callable, Any, Union, Dict
 
 import numpy as np
 import torch
