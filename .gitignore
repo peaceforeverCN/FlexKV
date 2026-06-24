@@ -76,3 +76,9 @@ cover/
 
 # logs
 *.log
+
+# PyTorch ROCm hipify artifacts (regenerated at build time; do not commit)
+csrc/**/*_hip.cpp
+csrc/**/*_hip.h
+csrc/**/*_hip.cuh
+csrc/**/*.hip

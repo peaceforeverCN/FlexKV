@@ -65,6 +65,21 @@ fi
 
 echo "=== Building in ${BUILD_TYPE} mode ==="
 
+# Auto-select ROCm builder when FLEXKV_GPU_BACKEND is unset and PyTorch is ROCm.
+if [ -z "${FLEXKV_GPU_BACKEND:-}" ]; then
+  DETECTED_BACKEND=$(python3 - <<'PY'
+import os
+try:
+    import torch
+    print("rocm" if getattr(torch.version, "hip", None) is not None else "nvidia")
+except Exception:
+    print("nvidia")
+PY
+)
+  export FLEXKV_GPU_BACKEND="$DETECTED_BACKEND"
+  echo "Auto-detected FLEXKV_GPU_BACKEND=$FLEXKV_GPU_BACKEND"
+fi
+
 # Install submodules
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git submodule update --init --recursive

@@ -41,7 +41,23 @@ debug = os.environ.get("FLEXKV_DEBUG") == "1"
 if debug:
     print("Running in debug mode - Cython compilation disabled")
 
-GPU_BACKEND = os.environ.get("FLEXKV_GPU_BACKEND", "nvidia").lower().strip() or "nvidia"
+def _detect_gpu_backend() -> str:
+    forced = os.environ.get("FLEXKV_GPU_BACKEND", "").lower().strip()
+    if forced:
+        return forced
+    try:
+        import torch
+
+        if getattr(torch.version, "hip", None) is not None:
+            return "rocm"
+    except Exception:
+        pass
+    return "nvidia"
+
+
+GPU_BACKEND = _detect_gpu_backend()
+if not os.environ.get("FLEXKV_GPU_BACKEND"):
+    os.environ["FLEXKV_GPU_BACKEND"] = GPU_BACKEND
 print(f"FLEXKV_GPU_BACKEND={GPU_BACKEND}")
 
 opts = dict(
