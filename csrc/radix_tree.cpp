@@ -164,10 +164,14 @@ CRadixNode *CRadixNode::split(int prefix_length) {
 
   set_parent(new_node);
 
-  // SWA: the snapshot stored on the original node covered the full pre-split
-  // range, which no longer exists. Free it (if any) and leave both halves as
-  // tombstones. new_node defaults to tombstone=true / slot=-1.
-  index->record_freed_swa_slot(this);
+  // SWA: keep this->swa_* untouched. After split, 'this' retains the trailing
+  // blocks of the original range (the prefix moved to new_node), so this's
+  // cumulative end depth is unchanged. The snapshot on 'this' is the trailing
+  // window ending at that same depth, hence still valid. 'new_node' is a fresh
+  // intermediate node at depth start+P that never had a snapshot; its default
+  // (swa_host_slot=-1, swa_tombstone=true) is already correct. Eviction,
+  // shrink, and merge_child still free slots through record_freed_swa_slot --
+  // those paths actually change the cumulative end depth.
   return new_node;
 }
 

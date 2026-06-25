@@ -109,9 +109,14 @@ class TestStep2Cascade:
         tree.evict(buf, 64)
         assert tree.drain_freed_swa_slots() == []
 
-    def test_split_drains_slot(self):
+    def test_split_preserves_slot(self):
+        # After a split, the original node retains the trailing blocks of
+        # its original range, so its cumulative end depth is unchanged.
+        # The SWA snapshot on it (the trailing window ending at that
+        # depth) is therefore still valid and MUST NOT be drained. The
+        # newly inserted intermediate parent has no snapshot of its own
+        # (defaults to swa_host_slot=-1 / tombstone=true).
         tree = _make_tree()
-        # Long sequence, then a sequence sharing a prefix to force a split.
         long_tokens = np.arange(0, TPB * 4, dtype=np.int64)
         node, _ = _insert(tree, long_tokens, 200)
         node.swa_host_slot = 9
@@ -124,7 +129,13 @@ class TestStep2Cascade:
         _insert(tree, seq2, 300)
 
         freed = tree.drain_freed_swa_slots()
-        assert 9 in freed
+        assert 9 not in freed, (
+            "split must preserve the surviving child SWA slot; freed=" + str(freed)
+        )
+        # The original node object is the surviving child after split and
+        # still holds its slot / non-tombstone state.
+        assert node.swa_host_slot == 9
+        assert node.swa_tombstone is False
 
     def test_drain_is_idempotent(self):
         tree = _make_tree()
