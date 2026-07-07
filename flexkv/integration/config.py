@@ -478,20 +478,47 @@ class FlexKVConfig:
         # stays None -> kvmanager.swa_available() always returns False -> the
         # connector never stores/reloads SWA KV, so host->device reload (H2D)
         # is never triggered for this all-SWA model.
+        #
+        # NOTE: under ``SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton`` the
+        # SWA rows do NOT live in the standalone SWA pool — they live inside
+        # ``unified_kv_pool.kv_buffer[L][:swa_pages]`` as bf16 rows with
+        # ``bytes_per_token_per_layer = head_dim * 2`` (= 1024 for DSv4-Pro's
+        # kv_lora_rank=512).  Both the connector process AND the flexkv server
+        # process consume this SWAPoolConfig — the connector to size extract
+        # blobs and the server to init its SWA production manager.  A
+        # previous fix tried to defer construction to the connector alone
+        # (2026-07-06), but that left the *server* with cache_config.swa=None
+        # so ``get_or_init_swa_manager`` always returned None → every
+        # ``swa_put`` failed → SWA was disabled end-to-end.  The correct fix
+        # is to construct SWAPoolConfig here for BOTH modes, with the right
+        # per-mode bpt.
         is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
+        is_unified_kv_triton = (
+            os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "") == "unified_kv_triton"
+        )
         if is_dsv4 and self.cache_config.swa is None:
             swa_window = 256  # physical swa_page_size, asserted == 256 by sglang
+            if is_unified_kv_triton:
+                # DSv4 unified SWA rows are bf16 head_dim per layer.
+                # DSv4-Pro (and every DSv4 variant on this codebase) uses
+                # kv_lora_rank=512 → head_dim = 512 → bpt = 512 * 2 = 1024.
+                bpt = 1024
+                mode_label = "DSv4 unified_kv_triton"
+            else:
+                # Standalone SWA pool: FP8 nope + BF16 rope + scale.
+                bpt = 584
+                mode_label = "DSv4 standalone"
             self.cache_config.swa = SWAPoolConfig(
                 enabled=True,
                 window_size=swa_window,
                 num_swa_layers=self.model_config.num_layers,
-                bytes_per_token_per_layer=584,
+                bytes_per_token_per_layer=bpt,
             )
             logger.info(
-                f"[FlexKV sglang] Constructed SWAPoolConfig for DSv4: "
+                f"[FlexKV sglang] Constructed SWAPoolConfig for {mode_label}: "
                 f"window_size={swa_window}, "
                 f"num_swa_layers={self.model_config.num_layers}, "
-                f"bytes_per_token_per_layer=584, "
+                f"bytes_per_token_per_layer={bpt}, "
                 f"num_slots={self.cache_config.swa.num_slots}, "
                 f"slot_size_bytes={self.cache_config.swa.slot_size_bytes}"
             )
