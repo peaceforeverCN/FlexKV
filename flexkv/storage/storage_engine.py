@@ -151,7 +151,15 @@ class StorageEngine:
         self._swa_remote_layout: Optional[KVCacheLayout] = None
         swa_cfg = getattr(self._cache_config, "swa", None)
         if swa_cfg is not None and swa_cfg.enabled:
-            swa_tokens_per_block = self._cache_config.tokens_per_block
+            # unified_kv_triton overrides the SWA page stride via
+            # SWAPoolConfig.tokens_per_block (== swa_ring_size on the GPU
+            # side). Standalone DSv4 / gemma leave it None and fall back to
+            # the model-wide CacheConfig.tokens_per_block.
+            swa_tokens_per_block = (
+                swa_cfg.tokens_per_block
+                if swa_cfg.tokens_per_block is not None
+                else self._cache_config.tokens_per_block
+            )
             if self._cache_config.enable_cpu:
                 # uint8, num_head=1, is_mla=True; per-token-per-layer bytes -> head_size.
                 self._swa_cpu_layout = KVCacheLayout(

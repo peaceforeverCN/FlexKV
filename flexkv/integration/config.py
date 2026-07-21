@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import *
+# ``import *`` intentionally skips names starting with ``_``; import
+# the normalizer explicitly so the DSv4 dispatch below can read it.
+from flexkv.common.config import _normalize_swa_multi_group
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, FullAttentionSpec
@@ -484,49 +487,130 @@ class FlexKVConfig:
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
 
         # ---- SWA host pool config (DeepSeek V4 all-SWA models) ----
-        # DSv4 stores its sliding-window KV in a dedicated paged pool. FlexKV's
-        # SWA page size is cache_config.tokens_per_block (hard-asserted as 256 by
-        # sglang model_runner_kv_cache_mixin), NOT the HF attention
-        # sliding_window (128). The per-token byte size is hard-asserted to
-        # 584 (qk_nope_head_dim fp8 448 + qk_rope_head_dim bf16 128 + scale 8)
-        # in DeepSeekV4SingleKVPool. Without this config, cache_config.swa
-        # stays None -> the cache engine never builds an SWA pool -> a SWA-aware
-        # get finds no SWA, so SWA KV is never matched/reused for this all-SWA model.
+        # DSv4 stores its sliding-window KV in a dedicated paged pool. In the
+        # standalone (per-ratio) pool mode, FlexKV's SWA page geometry follows
+        # DeepSeekV4SingleKVPool (padded 585-byte tokens over cache_config.
+        # tokens_per_block tokens/page).  In unified_kv_triton mode, SWA / c4 /
+        # c128 share one BF16 table with head_dim=512 -> 1024 bytes/token, and
+        # the SWA page stride equals unified_kv_pool.swa_ring_size (=
+        # sliding_window + spec_extra), not cache_config.tokens_per_block.
+        #
+        # Additionally, ``UserConfig.swa_multi_group`` is now a tri-state int
+        # enum {0, 1, 2} (see flexkv.common.config._normalize_swa_multi_group):
+        #   - 0 -> register nothing SWA-related; skip SWAPoolConfig entirely.
+        #   - 1 -> register SWA KV only (no attention/indexer state sidecar).
+        #   - 2 -> register SWA + attention state + indexer state (default).
         is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
+        is_unified_kv_triton = bool(
+            getattr(sglang_config, "is_unified_kv_triton", False)
+        )
+        mg_enum = _normalize_swa_multi_group(self.user_config.swa_multi_group)
+
         if is_dsv4:
-            swa_page_size = self.cache_config.tokens_per_block
-            # bytes_per_token_per_layer MUST match the GPU SWA buffer's *padded*
-            # per-token stride, not the logical 584. DeepSeekV4SingleKVPool packs
-            # each page as bytes_per_page_padded = ceil_div(swa_page * 584, 576) *
-            # 576 = ceil_div(256*584, 576)*576 = 149760, so the effective per-token
-            # width the connector registers as head_size is 149760 / 256 = 585
-            # (584 logical + 256B/page alignment padding spread over the tokens).
-            # The FlexKV host SWA pool must use the SAME 585 so H2D/D2H byte offsets
-            # line up with the GPU buffer stride; a 584 host layout would shear the
-            # bytes by 1/token/page and corrupt the SWA KV. See connector
-            # _register_to_server_dsv4 (swa_layout head_size)
-            if self.cache_config.swa is None:
-                swa_bytes_per_token = _dsv4_swa_padded_bytes_per_token(
-                    swa_page_size, 584)
-                self.cache_config.swa = SWAPoolConfig(
-                    enabled=True,
-                    num_swa_layers=self.model_config.num_layers,
-                    bytes_per_token_per_layer=swa_bytes_per_token,
+            if mg_enum == 0:
+                # Register nothing SWA-related. Keep cache_config.swa as None so
+                # the cache engine never builds a CPU SWA pool and the layerwise
+                # transfer never opens the SWA data plane.
+                assert self.cache_config.swa is None, (
+                    "swa_multi_group=0 requires cache_config.swa to remain "
+                    "None, but it was already set by a prior init path"
                 )
-            # Gate the SWA data plane (byte movement) behind an env switch so it
-            # can be turned off for A/B or if a byte-layout issue surfaces in
-            # production, degrading cleanly to full-KV-only (all build_*_chain
-            # become no-ops). Default ON for DSv4 (the SWA-native arch).
-            self.cache_config.enable_swa_transfer = \
-                _dsv4_swa_transfer_enabled_from_env()
-            logger.info(
-                f"[FlexKV sglang] Constructed SWAPoolConfig for DSv4: "
-                f"swa_page_size={swa_page_size}, "
-                f"num_swa_layers={self.model_config.num_layers}, "
-                f"bytes_per_token_per_layer="
-                f"{self.cache_config.swa.bytes_per_token_per_layer} (padded), "
-                f"num_slots={self.cache_config.swa.num_slots}, "
-                f"enable_swa_transfer={self.cache_config.enable_swa_transfer}"
+                logger.info(
+                    "[FlexKV sglang] DSv4 detected but swa_multi_group=0; "
+                    "skipping SWAPoolConfig construction (SWA / attention-"
+                    "state / indexer-state all disabled). "
+                    f"is_unified_kv_triton={is_unified_kv_triton}"
+                )
+            elif is_unified_kv_triton:
+                # unified_kv_triton: SWA segment lives in the same BF16 table
+                # as c4/c128 (head_dim = qk_nope + qk_rope = 512 -> 1024 bytes/
+                # token). The SWA page stride equals the GPU-side ring stride,
+                # which sglang publishes via ``unified_swa_ring_size`` on the
+                # sglang model config.
+                unified_head_bytes = int(
+                    getattr(sglang_config, "unified_head_bytes", 0)
+                )
+                unified_swa_ring_size = int(
+                    getattr(sglang_config, "unified_swa_ring_size", 0)
+                )
+                if unified_head_bytes <= 0 or unified_swa_ring_size <= 0:
+                    raise RuntimeError(
+                        "unified_kv_triton mode requires sglang_config to "
+                        "expose ``unified_head_bytes`` (bytes per SWA/c4/c128 "
+                        "row) and ``unified_swa_ring_size`` (tokens per SWA "
+                        f"ring slot); got head_bytes={unified_head_bytes}, "
+                        f"ring_size={unified_swa_ring_size}"
+                    )
+                # Guard against accidental fallback to the standalone padded
+                # 585-byte layout under unified.
+                assert unified_head_bytes == 1024, (
+                    "unified_kv_triton head_bytes must be 1024 (BF16 * 512), "
+                    f"got {unified_head_bytes}"
+                )
+                if self.cache_config.swa is None:
+                    self.cache_config.swa = SWAPoolConfig(
+                        enabled=True,
+                        num_swa_layers=self.model_config.num_layers,
+                        bytes_per_token_per_layer=unified_head_bytes,
+                        tokens_per_block=unified_swa_ring_size,
+                    )
+                self.cache_config.enable_swa_transfer = \
+                    _dsv4_swa_transfer_enabled_from_env()
+                logger.info(
+                    "[FlexKV sglang] Constructed SWAPoolConfig for DSv4 "
+                    "(unified_kv_triton): "
+                    f"tokens_per_block={self.cache_config.swa.tokens_per_block}"
+                    f" (= swa_ring_size), num_swa_layers="
+                    f"{self.model_config.num_layers}, "
+                    f"bytes_per_token_per_layer="
+                    f"{self.cache_config.swa.bytes_per_token_per_layer} "
+                    f"(BF16*512=1024), num_slots="
+                    f"{self.cache_config.swa.num_slots}, "
+                    f"enable_swa_transfer={self.cache_config.enable_swa_transfer}, "
+                    f"swa_multi_group={mg_enum}"
+                )
+            else:
+                # Standalone (per-ratio pool) mode. FlexKV's SWA page size is
+                # cache_config.tokens_per_block (hard-asserted as 256 by sglang
+                # model_runner_kv_cache_mixin), NOT the HF attention
+                # sliding_window (128). The per-token byte size is hard-asserted
+                # to 584 (nope fp8 448 + rope bf16 128 + scale 8) in
+                # DeepSeekV4SingleKVPool. bytes_per_token_per_layer MUST match
+                # the GPU SWA buffer's *padded* per-token stride, not the
+                # logical 584: DeepSeekV4SingleKVPool packs each page as
+                # bytes_per_page_padded = ceil_div(swa_page * 584, 576) * 576,
+                # so the effective per-token width the connector registers as
+                # head_size is 585 (584 logical + 256B/page alignment padding
+                # spread over the tokens).  The FlexKV host SWA pool must use
+                # the SAME 585 so H2D/D2H byte offsets line up with the GPU
+                # buffer stride.
+                swa_page_size = self.cache_config.tokens_per_block
+                if self.cache_config.swa is None:
+                    swa_bytes_per_token = _dsv4_swa_padded_bytes_per_token(
+                        swa_page_size, 584)
+                    self.cache_config.swa = SWAPoolConfig(
+                        enabled=True,
+                        num_swa_layers=self.model_config.num_layers,
+                        bytes_per_token_per_layer=swa_bytes_per_token,
+                    )
+                self.cache_config.enable_swa_transfer = \
+                    _dsv4_swa_transfer_enabled_from_env()
+                logger.info(
+                    f"[FlexKV sglang] Constructed SWAPoolConfig for DSv4: "
+                    f"swa_page_size={swa_page_size}, "
+                    f"num_swa_layers={self.model_config.num_layers}, "
+                    f"bytes_per_token_per_layer="
+                    f"{self.cache_config.swa.bytes_per_token_per_layer} (padded), "
+                    f"num_slots={self.cache_config.swa.num_slots}, "
+                    f"enable_swa_transfer={self.cache_config.enable_swa_transfer}, "
+                    f"swa_multi_group={mg_enum}"
+                )
+
+        # Final gate: enum==0 must leave cache_config.swa untouched.
+        if mg_enum == 0:
+            assert self.cache_config.swa is None, (
+                "swa_multi_group=0 must keep cache_config.swa=None; "
+                "something set it downstream"
             )
 
         logger.info(f"[FlexKV sglang] {self.model_config}, {rank_info}")

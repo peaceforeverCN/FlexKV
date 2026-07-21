@@ -576,6 +576,12 @@ class SWAPoolConfig:
     num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
+    # SWA page stride in tokens. ``None`` means "inherit
+    # ``CacheConfig.tokens_per_block``" (the legacy/standalone default).
+    # unified_kv_triton passes an explicit stride equal to
+    # ``unified_kv_pool.swa_ring_size`` (= ``sliding_window + spec_extra``)
+    # so the host SWA page geometry matches the GPU SWA ring stride.
+    tokens_per_block: Optional[int] = None
     # True when the SWA page also carries heterogeneous sidecar groups (for
     # example DeepSeek-V4 attention/indexer compress states).  Layerwise GET
     # still fuses SWA/state H2D into LAYERWISE via launch_swa_mg_h2d_layer_;
@@ -815,11 +821,17 @@ class UserConfig:
     redis_password: Optional[str] = None
     node_ttl_seconds: Optional[int] = None
     kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32", "nvfp4" (packed fp4+fp8-scale, stored as uint8)
-    # DeepSeek-V4 SWA sidecar policy. None/True enables attention and indexer
-    # compress-state I/O together with SWA; False keeps the legacy SWA-only
-    # path. None is intentionally distinct from False so old configs default
-    # to the correctness-preserving state restore path.
-    swa_multi_group: Optional[bool] = None
+    # DeepSeek-V4 SWA sidecar policy. Tri-state integer enum (breaking change:
+    # bool True/False are no longer accepted):
+    #   0 -> register nothing SWA-related (no SWA KV, no attention state,
+    #        no indexer state). Suitable for unified_kv_triton where the GPU
+    #        owns SWA entirely, or for A/B tests that skip FlexKV SWA I/O.
+    #   1 -> register SWA KV only, skip attention/indexer compress-state
+    #        sidecars.
+    #   2 -> register SWA KV + attention state + indexer state (full sidecar).
+    #   None (unset) -> normalized to 2 (preserve legacy default).
+    # See _normalize_swa_multi_group() for the actual normalization.
+    swa_multi_group: Optional[int] = None
     # Fuse SWA/state H2D into the main layerwise restore worker. Disable this to
     # keep SWA/state on the standalone predecessor worker as a compatibility or
     # debugging fallback.
@@ -833,18 +845,48 @@ class UserConfig:
         if self.ssd_cache_gb > 0 and self.ssd_cache_gb <= self.cpu_cache_gb:
             raise ValueError(f"Invalid ssd_cache_gb: {self.ssd_cache_gb}, "
                              f"must be greater than cpu_cache_gb: {self.cpu_cache_gb}.")
-        if self.swa_multi_group is not None and not isinstance(
-            self.swa_multi_group, bool
-        ):
-            raise ValueError(
-                "swa_multi_group must be a boolean when configured, "
-                f"got {self.swa_multi_group!r}"
-            )
+        if self.swa_multi_group is not None:
+            # Breaking change: swa_multi_group is now an integer enum in {0, 1, 2}.
+            # Reject bool explicitly (bool is a subclass of int in Python, so
+            # this check MUST come before the int check).
+            if isinstance(self.swa_multi_group, bool):
+                raise ValueError(
+                    "swa_multi_group has changed from bool semantics to an "
+                    "int enum {0, 1, 2}. Please migrate: `true -> 2` (full "
+                    "sidecar), `false -> 1` (SWA-only). "
+                    f"got {self.swa_multi_group!r}"
+                )
+            if not isinstance(self.swa_multi_group, int):
+                raise ValueError(
+                    "swa_multi_group must be an int in {0, 1, 2} when "
+                    f"configured, got {self.swa_multi_group!r} "
+                    f"(type={type(self.swa_multi_group).__name__})"
+                )
+            if self.swa_multi_group not in (0, 1, 2):
+                raise ValueError(
+                    "swa_multi_group must be one of {0, 1, 2}, "
+                    f"got {self.swa_multi_group!r}"
+                )
         if not isinstance(self.swa_multi_layer, bool):
             raise ValueError(
                 "swa_multi_layer must be a boolean, "
                 f"got {self.swa_multi_layer!r}"
             )
+
+
+def _normalize_swa_multi_group(value: Optional[int]) -> int:
+    """Normalize a validated ``swa_multi_group`` enum value.
+
+    - ``None`` (unset) -> ``2`` (preserve legacy default: full sidecar).
+    - ``0`` / ``1`` / ``2`` -> unchanged.
+
+    The caller MUST have already run the value through ``UserConfig`` (or
+    perform equivalent type + range validation), otherwise this function
+    passes through non-canonical values.
+    """
+    if value is None:
+        return 2
+    return int(value)
 
 def parse_path_list(path_str: str) -> List[str]:
     paths = [p.strip() for p in path_str.split(';') if p.strip()]
@@ -875,6 +917,27 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
 
     return user_config
 
+def _parse_swa_multi_group_env(raw: Optional[str]) -> Optional[int]:
+    """Parse ``FLEXKV_SWA_MULTI_GROUP`` env var into the tri-state int enum.
+
+    Only ``"0"`` / ``"1"`` / ``"2"`` are accepted; ``None`` (unset) is passed
+    through so the caller can fall back to the ``UserConfig`` default. Any
+    other value (including legacy bool strings like ``"true"`` / ``"false"``)
+    raises ``ValueError`` with a migration hint.
+    """
+    if raw is None:
+        return None
+    # Reject legacy bool strings and any non-canonical value up front so the
+    # error surfaces at startup with a clear migration hint.
+    if raw not in ("0", "1", "2"):
+        raise ValueError(
+            f"FLEXKV_SWA_MULTI_GROUP={raw!r} is invalid; must be one of "
+            "{'0', '1', '2'} (bool 'true' / 'false' are no longer accepted; "
+            "migrate as: 'true' -> '2', 'false' -> '1')"
+        )
+    return int(raw)
+
+
 def load_user_config_from_env() -> UserConfig:
     swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
     return UserConfig(
@@ -888,11 +951,7 @@ def load_user_config_from_env() -> UserConfig:
         use_hugepage_tmp_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_TMP_BUFFER', 0))),
         hugepage_size_bytes=int(os.getenv('FLEXKV_HUGEPAGE_SIZE_BYTES', 2 * 1024 * 1024)),
         kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
-        swa_multi_group=(
-            None
-            if swa_multi_group_env is None
-            else bool(int(swa_multi_group_env))
-        ),
+        swa_multi_group=_parse_swa_multi_group_env(swa_multi_group_env),
         swa_multi_layer=bool(int(os.getenv('FLEXKV_SWA_MULTI_LAYER', 1))),
     )
 

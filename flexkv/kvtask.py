@@ -412,13 +412,19 @@ class KVTaskManager:
                                                                 self.cache_config.tokens_per_block)
         # Late-bind the GPU-side SWA slots via the unified set_gpu_blocks(gpu,
         # swa_gpu) path (PR#191). SWA is page-granular, so the mapping folds by
-        # the same stride as full-KV (slot_mapping_to_block_ids).
+        # the SWA-specific stride: unified_kv_triton uses SWAPoolConfig.
+        # tokens_per_block (= swa_ring_size), while standalone DSv4/gemma fall
+        # back to the model-wide cache_config.tokens_per_block.
         # A None swa_slot_mapping leaves the graph's SWA ops at their built ids.
         swa_sm = swa_slot_mapping if swa_slot_mapping is not None else task.swa_slot_mapping
         swa_graph_ids = None
         if swa_sm is not None:
+            swa_cfg = getattr(self.cache_config, "swa", None)
+            swa_stride = self.cache_config.tokens_per_block
+            if swa_cfg is not None and swa_cfg.tokens_per_block is not None:
+                swa_stride = swa_cfg.tokens_per_block
             swa_graph_ids = self.cache_engine.slot_mapping_to_block_ids(
-                swa_sm, self.cache_config.tokens_per_block)
+                swa_sm, swa_stride)
         task.graph.set_gpu_blocks(graph_ids, swa_graph_ids)
         task.slot_mapping = slot_mapping
         task.status = TaskStatus.READY
