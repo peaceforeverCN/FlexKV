@@ -767,7 +767,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
     slru_protected_threshold=int(os.getenv('FLEXKV_SLRU_PROTECTED_THRESHOLD', 2)),
 
-    enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
+    enable_mps=(bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1)))
+                and not _is_rocm_runtime()),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),

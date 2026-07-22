@@ -21,8 +21,8 @@ from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
 import numpy as np
-import nvtx
 import torch
+from flexkv.common.tracing import nvtx
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
 from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
 from flexkv.cache.redis_meta import RedisMeta, dist_available

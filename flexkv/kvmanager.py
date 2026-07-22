@@ -112,9 +112,13 @@ class KVManager:
 
     def start(self) -> None:
         if self.enable_mps:
-            # try to start MPS
-            subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
-            flexkv_logger.debug("MPS started")
+            # CUDA MPS is NVIDIA-only; skip silently on ROCm even if the flag
+            # was accidentally left on.
+            if getattr(torch.version, "hip", None):
+                flexkv_logger.debug("MPS skipped: ROCm does not support CUDA MPS")
+            else:
+                subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
+                flexkv_logger.debug("MPS started")
 
         if not self.server_client_mode:
             self.kv_task_engine.start()
@@ -138,7 +142,7 @@ class KVManager:
         else:
             self.kv_task_engine.shutdown()
 
-        if self.enable_mps:
+        if self.enable_mps and not getattr(torch.version, "hip", None):
             flexkv_logger.info(
                 "MPS is enabled. To stop MPS daemon manually, run: "
                 "'echo quit | nvidia-cuda-mps-control'"
