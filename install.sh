@@ -224,11 +224,14 @@ for cmd in python3 cmake git gcc g++; do
     command -v "$cmd" &>/dev/null || error "$cmd is still not available. Please install it manually."
 done
 
-# Check NVIDIA CUDA toolkit
-if ! command -v nvcc &>/dev/null; then
-    warn "nvcc not found. CUDA toolkit is required for building FlexKV."
-    warn "Please install CUDA toolkit from: https://developer.nvidia.com/cuda-downloads"
-    warn "Or load it via: module load cuda"
+# Check the GPU compiler required by the installed PyTorch build.
+if python3 -c "import torch; raise SystemExit(0 if torch.version.hip else 1)"; then
+    check_command hipcc || error "ROCm PyTorch requires hipcc to build FlexKV."
+else
+    if ! command -v nvcc &>/dev/null; then
+        warn "nvcc not found. CUDA toolkit is required for CUDA PyTorch builds."
+        warn "Install CUDA or use a ROCm PyTorch environment with hipcc."
+    fi
 fi
 
 success "System dependencies check passed."
@@ -266,11 +269,10 @@ if [ "$BUILD_TYPE" = "release" ]; then
     pip install -q "Cython>=3.0.10"
 fi
 
-# Check if torch is installed
+# A GPU extension must be built against the caller's matching PyTorch variant.
+# Do not silently install a CUDA wheel in a ROCm environment.
 if ! python3 -c "import torch" &>/dev/null 2>&1; then
-    warn "PyTorch not found. Installing PyTorch..."
-    warn "If you need a specific CUDA version, please install PyTorch manually first."
-    pip install torch
+    error "PyTorch is not installed. Install a matching CUDA or ROCm PyTorch build before running install.sh."
 fi
 success "Python environment ready."
 
@@ -332,7 +334,7 @@ info "Step 4.5: Installing Python runtime dependencies"
 info "============================================"
 
 # Core runtime dependencies (always needed)
-RUNTIME_DEPS="numpy pyzmq psutil nvtx pyyaml expiring-dict"
+RUNTIME_DEPS="numpy pyzmq psutil pyyaml expiring-dict"
 
 # Additional dependencies for P2P/distributed mode
 if [ "$ENABLE_P2P" -eq 1 ]; then

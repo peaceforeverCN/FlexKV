@@ -14,6 +14,10 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 
 
+def _is_rocm_runtime() -> bool:
+    return bool(getattr(torch.version, "hip", None))
+
+
 @dataclass
 class LayerGroupSpec:
     """One group of layers sharing the same KV cache shape.
@@ -738,14 +742,19 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     enable_layerwise_transfer=bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', 0))),
 
-    use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
-    use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),
+    # ROCm extensions are CE-only: enable both directions by default and keep
+    # the unvalidated CUDA memcpy2D fast path disabled.
+    use_ce_transfer_h2d=(bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0)))
+                         or _is_rocm_runtime()),
+    use_ce_transfer_d2h=(bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0)))
+                         or _is_rocm_runtime()),
     transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
     transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
     transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
     transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
-    enable_ce_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1))),
+    enable_ce_memcpy2d=(bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1)))
+                        and not _is_rocm_runtime()),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
@@ -871,7 +880,8 @@ def load_user_config_from_env() -> UserConfig:
         cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
-        enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
+        enable_gds=(bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0)))
+                    and not _is_rocm_runtime()),
         enable_nixl=bool(int(os.getenv('FLEXKV_ENABLE_NIXL', 0))),
         use_hugepage_cpu_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_CPU_BUFFER', 0))),
         use_hugepage_tmp_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_TMP_BUFFER', 0))),

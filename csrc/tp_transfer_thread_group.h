@@ -21,7 +21,7 @@
 #include "ce_transfer.h"
 #include <atomic>
 #include <condition_variable>
-#include <cuda_runtime.h>
+#include "rocm_utils.h"
 #include <functional>
 #include <future>
 #include <memory>

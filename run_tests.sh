@@ -5,16 +5,17 @@
 # 获取脚本所在目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 设置库路径
-export LD_LIBRARY_PATH="${SCRIPT_DIR}/build/lib:/usr/local/cuda-11.8/targets/x86_64-linux/lib/stubs:/data/home/phaedonsun/.local/lib/python3.6/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+# Resolve the active PyTorch runtime library directory instead of relying on a
+# machine-specific CUDA stub path. This works for both CUDA and ROCm PyTorch.
+TORCH_LIB_DIR="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')" || exit $?
+export LD_LIBRARY_PATH="${SCRIPT_DIR}/build/lib:${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}"
 
 echo "=========================================="
 echo "FlexKV 测试运行脚本"
 echo "=========================================="
 echo "库路径已设置:"
 echo "  - ${SCRIPT_DIR}/build/lib"
-echo "  - /usr/local/cuda-11.8/targets/x86_64-linux/lib/stubs"
-echo "  - PyTorch 库路径"
+echo "  - ${TORCH_LIB_DIR}"
 echo ""
 
 # 检查是否提供了测试文件参数

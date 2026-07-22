@@ -29,6 +29,7 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 # Skip conditions
 
+IS_ROCM = bool(getattr(torch.version, "hip", None))
 NUM_GPUS = min(4, torch.cuda.device_count()) if torch.cuda.is_available() else 0
 
 pytestmark = pytest.mark.skipif(
@@ -147,14 +148,18 @@ CPU_LAYOUTS = [
     pytest.param("BLOCKFIRST", id="bfirst"),
 ]
 
-ENGINES = [
-    pytest.param("cuda", False, id="cuda"),
-    pytest.param("ce", True, id="ce"),
-]
+ENGINES = (
+    [pytest.param("ce", True, id="ce")]
+    if IS_ROCM
+    else [
+        pytest.param("cuda", False, id="cuda"),
+        pytest.param("ce", True, id="ce"),
+    ]
+)
 
 MLA_MODES = ["sharded", "all_write", "rank0_only", "layer_parallel", "rank_rotate"]
 
-CE_MEMCPY2D_CONFIGS = [False, True]
+CE_MEMCPY2D_CONFIGS = [False] if IS_ROCM else [False, True]
 
 
 # Helpers (matching production code in worker.py / layerwise.py)

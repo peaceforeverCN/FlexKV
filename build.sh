@@ -3,6 +3,7 @@ set -e
 
 PROJECT_ROOT=$(pwd)
 BUILD_TYPE="debug"  # Default to debug build
+ROCM_BUILD=0
 
 # Parse command line arguments
 for arg in "$@"; do
@@ -17,6 +18,10 @@ for arg in "$@"; do
       ;;
     --clean)
       BUILD_TYPE="clean"
+      shift
+      ;;
+    --rocm)
+      ROCM_BUILD=1
       shift
       ;;
     *)
@@ -64,6 +69,17 @@ if [ "$BUILD_TYPE" = "clean" ]; then
 fi
 
 echo "=== Building in ${BUILD_TYPE} mode ==="
+
+if [ "$ROCM_BUILD" = "1" ]; then
+  command -v hipcc >/dev/null 2>&1 || {
+    echo "ERROR: --rocm requires hipcc in PATH" >&2
+    exit 1
+  }
+  export FLEXKV_USE_ROCM=1
+  export FLEXKV_ENABLE_GDS=0
+  export FLEXKV_ENABLE_NVCOMP=0
+  echo "=== ROCm CE-only build: PTX, GDS, nvCOMP, and NVTX are disabled ==="
+fi
 
 # Install submodules
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

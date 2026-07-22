@@ -13,7 +13,7 @@ from threading import Thread
 from typing import List, Any, Dict, Union, Optional, Tuple
 
 import numpy as np
-import nvtx
+from flexkv.common.tracing import nvtx
 import torch
 import zmq
 import json

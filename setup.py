@@ -9,6 +9,22 @@ from setuptools import find_packages, setup
 from torch.utils import cpp_extension
 
 
+def is_rocm_build() -> bool:
+    """Return whether this extension is being built against ROCm PyTorch."""
+    if os.environ.get("FLEXKV_USE_ROCM") == "1":
+        return True
+    if os.environ.get("FLEXKV_USE_ROCM") == "0":
+        return False
+    try:
+        import torch
+        return bool(torch.version.hip)
+    except Exception:
+        return False
+
+
+IS_ROCM_BUILD = is_rocm_build()
+
+
 class NvcompInfo(NamedTuple):
     include_dirs: list
     lib_dir: str
@@ -230,10 +246,18 @@ enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
+if IS_ROCM_BUILD:
+    if enable_gds or enable_nvcomp:
+        print("ROCm CE-only build: disabling unsupported GDS and nvCOMP modules")
+    enable_gds = False
+    enable_nvcomp = False
+    os.environ["FLEXKV_ENABLE_GDS"] = "0"
+    os.environ["FLEXKV_ENABLE_NVCOMP"] = "0"
+
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
     "csrc/bindings.cpp",
-    "csrc/transfer.cu",  # Skip CUDA file for now
+    "csrc/ce_transfer_dispatch.cu" if IS_ROCM_BUILD else "csrc/transfer.cu",
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
@@ -252,20 +276,25 @@ hpp_sources = [
     "csrc/eviction_strategy.h",
     "csrc/layerwise.h",
     "csrc/ce_transfer.h",
+    "csrc/rocm_utils.h",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
 
 # extra_link_args: dist/Redis (libhiredis) only when FLEXKV_ENABLE_P2P=1
 lib_dir = os.path.join(build_dir, "lib")
 library_dirs = [lib_dir]
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+extra_link_args = ["-lxxhash", "-lpthread", "-lrt", "-luring"]
+if not IS_ROCM_BUILD:
+    extra_link_args.insert(0, "-lcuda")
 if enable_p2p:
     extra_link_args.append("-lhiredis")
 
 if enable_cputest:
-    extra_link_args.remove("-lcuda")
-    # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
+    if "-lcuda" in extra_link_args:
+        extra_link_args.remove("-lcuda")
+    # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available.
+    if not IS_ROCM_BUILD:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
 
 
 # Prometheus libraries only when metrics enabled
@@ -273,12 +302,20 @@ if enable_metrics:
     extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
 else:
     print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
-# Auto-detect GPU architecture if TORCH_CUDA_ARCH_LIST is not explicitly set
-if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
-print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
+
+if IS_ROCM_BUILD:
+    # CUDAExtension delegates .cu compilation to hipcc with ROCm PyTorch.  Do
+    # not populate CUDA-only architecture flags in this mode; PyTorch resolves
+    # PYTORCH_ROCM_ARCH (when set) or the local ROCm target instead.
+    print("Building CE-only ROCm/HIP extension")
+else:
+    if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
+    print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
 extra_compile_args = ["-std=c++17", "-O3"]
+if IS_ROCM_BUILD:
+    extra_compile_args.extend(["-DFLEXKV_USE_ROCM", "-DFLEXKV_CE_ONLY"])
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 include_dirs = [
@@ -298,9 +335,12 @@ if enable_cfs:
     hpp_sources.append("csrc/pcfs/pcfs.h")
     extra_link_args.append("-lhifs_client_sdk")
     extra_compile_args.append("-DFLEXKV_ENABLE_CFS")
-extra_compile_args.append("-DCUDA_AVAILABLE")
+if not IS_ROCM_BUILD:
+    extra_compile_args.append("-DCUDA_AVAILABLE")
 
 nvcc_compile_args = ["-O3"]
+if IS_ROCM_BUILD:
+    nvcc_compile_args.extend(["-DFLEXKV_USE_ROCM", "-DFLEXKV_CE_ONLY"])
 if enable_metrics:
     nvcc_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 if enable_gds:

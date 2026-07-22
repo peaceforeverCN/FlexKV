@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import ctypes
 import weakref
 from dataclasses import dataclass
@@ -14,34 +12,47 @@ from flexkv.storage.allocator import (
     free_hugepage_tensor,
 )
 
-_cudart = None
-_cudart_load_error: Optional[OSError] = None
+_gpu_runtime = None
+_gpu_runtime_load_error: Optional[OSError] = None
 
 
-def _get_cudart():
-    global _cudart
-    global _cudart_load_error
+def _is_rocm() -> bool:
+    return bool(getattr(torch.version, "hip", None))
 
-    if _cudart is None and _cudart_load_error is None:
-        try:
-            _cudart = ctypes.CDLL("libcudart.so")
-        except OSError as e:
-            _cudart_load_error = e
 
-    if _cudart is None:
-        raise RuntimeError(f"libcudart.so is unavailable: {_cudart_load_error}")
-    return _cudart
+def _get_gpu_runtime():
+    global _gpu_runtime
+    global _gpu_runtime_load_error
+
+    if _gpu_runtime is None and _gpu_runtime_load_error is None:
+        library_names = ("libamdhip64.so", "libamdhip64.so.6") if _is_rocm() else ("libcudart.so",)
+        for library_name in library_names:
+            try:
+                _gpu_runtime = ctypes.CDLL(library_name)
+                break
+            except OSError as exc:
+                _gpu_runtime_load_error = exc
+
+    if _gpu_runtime is None:
+        runtime_name = "libamdhip64.so" if _is_rocm() else "libcudart.so"
+        raise RuntimeError(f"{runtime_name} is unavailable: {_gpu_runtime_load_error}")
+    return _gpu_runtime
+
+
+def _runtime_symbol(cuda_name: str, hip_name: str):
+    return getattr(_get_gpu_runtime(), hip_name if _is_rocm() else cuda_name)
 
 
 def cuda_host_registration_available() -> bool:
     try:
-        _get_cudart()
+        _get_gpu_runtime()
     except RuntimeError:
         return False
     return True
 
 
-# Portable + Mapped: required for custom D2H kernels that store into host pointers.
+# Portable + Mapped is retained for CUDA compatibility. CE-only ROCm uses the
+# same host-registration flags with HIP runtime entry points.
 CUDA_HOST_REGISTER_PORTABLE = 0x01
 CUDA_HOST_REGISTER_MAPPED = 0x02
 CUDA_HOST_ALLOC_PORTABLE = 0x01
@@ -49,23 +60,25 @@ CUDA_HOST_ALLOC_MAPPED = 0x02
 
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
-    cudart = _get_cudart()
+    runtime_register = _runtime_symbol("cudaHostRegister", "hipHostRegister")
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
     flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
-    ret = cudart.cudaHostRegister(
+    ret = runtime_register(
         ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_uint(flags)
     )
     if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+        api = "hipHostRegister" if _is_rocm() else "cudaHostRegister"
+        raise RuntimeError(f"{api} failed with error code {ret}")
 
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    cudart = _get_cudart()
+    runtime_unregister = _runtime_symbol("cudaHostUnregister", "hipHostUnregister")
     ptr = tensor.data_ptr()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+    ret = runtime_unregister(ctypes.c_void_p(ptr))
     if ret != 0:
-        raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
+        api = "hipHostUnregister" if _is_rocm() else "cudaHostUnregister"
+        raise RuntimeError(f"{api} failed with error code {ret}")
 
 
 @dataclass
@@ -79,11 +92,11 @@ class HostBufferHandle:
             raise ValueError("CUDA-registered host buffer must be HugePage-backed")
 
     @classmethod
-    def pinned(cls, tensor: torch.Tensor) -> HostBufferHandle:
+    def pinned(cls, tensor: torch.Tensor) -> "HostBufferHandle":
         return cls(tensor=tensor)
 
     @classmethod
-    def hugepage(cls, tensor: torch.Tensor) -> HostBufferHandle:
+    def hugepage(cls, tensor: torch.Tensor) -> "HostBufferHandle":
         return cls(tensor=tensor, is_hugepage=True, is_cuda_registered=True)
 
     def release(self) -> None:
@@ -105,18 +118,22 @@ class HostBufferHandle:
 
 
 def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
-    """cudaHostAlloc(PORTABLE|MAPPED) buffer writable from device kernels."""
-    cudart = _get_cudart()
+    """Allocate portable mapped host memory through CUDA or HIP runtime."""
+    if num_elements <= 0:
+        raise ValueError("num_elements must be positive")
     num_bytes = num_elements * dtype.itemsize
     host_ptr = ctypes.c_void_p()
     flags = CUDA_HOST_ALLOC_PORTABLE | CUDA_HOST_ALLOC_MAPPED
-    err = cudart.cudaHostAlloc(
+    runtime_alloc = _runtime_symbol("cudaHostAlloc", "hipHostMalloc")
+    runtime_free = _runtime_symbol("cudaFreeHost", "hipHostFree")
+    err = runtime_alloc(
         ctypes.byref(host_ptr),
         ctypes.c_size_t(num_bytes),
         ctypes.c_uint(flags),
     )
-    if err != 0:
-        raise RuntimeError(f"cudaHostAlloc(mapped) failed with error code {err}")
+    if err != 0 or not host_ptr.value:
+        api = "hipHostMalloc" if _is_rocm() else "cudaHostAlloc"
+        raise RuntimeError(f"{api}(mapped) failed with error code {err}")
 
     buf_type = ctypes.c_uint8 * num_bytes
     raw = buf_type.from_address(host_ptr.value)
@@ -125,7 +142,7 @@ def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Ten
         torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes)
         .view(dtype)[:num_elements]
     )
-    weakref.finalize(tensor, lambda p=host_ptr: cudart.cudaFreeHost(p))
+    weakref.finalize(tensor, runtime_free, host_ptr)
     return tensor
 
 

@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include <cuda_runtime.h>
+#include "rocm_utils.h"
 
 namespace flexkv {
 

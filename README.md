@@ -65,8 +65,18 @@ apt install libhiredis-dev
 
 ```bash
 ./build.sh
-#./build.sh --release for cython package
+# ./build.sh --release for cython package
 ```
+
+### ROCm CE-only build
+
+Use a ROCm PyTorch environment with `hipcc` available, then build with:
+
+```bash
+./build.sh --rocm
+```
+
+The ROCm target uses the CE host-staging transfer path only. It does not build the CUDA PTX kernel, GDS/cuFile, nvCOMP compression, or NVTX tracing; `FLEXKV_USE_CE_TRANSFER_H2D=1` and `FLEXKV_USE_CE_TRANSFER_D2H=1` are enabled automatically for ROCm PyTorch.
 
 ### Use FlexKV with vLLM
 

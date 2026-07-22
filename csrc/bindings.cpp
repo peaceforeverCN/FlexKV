@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -7,9 +8,8 @@
 #include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
+#include "rocm_utils.h"
 #include <fcntl.h>
-#include <nvtx3/nvToolsExt.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>
@@ -18,8 +18,10 @@
 #include <unistd.h>
 
 #include "cache_utils.h"
+#ifdef FLEXKV_ENABLE_GDS
 #include "gds/gds_manager.h"
 #include "gds/tp_gds_transfer_thread_group.h"
+#endif
 #include "pcfs/pcfs.h"
 #include "radix_tree.h"
 #include "tp_transfer_thread_group.h"
@@ -59,6 +61,50 @@ void transfer_kv_blocks_binding(
     bool ce_path_opt = false,
     int ce_segment_threshold = 8, int ce_force_path = -1,
     bool ce_enable_memcpy2d = false, bool is_blockfirst = false) {
+  TORCH_CHECK(gpu_block_id_tensor.device().is_cpu() &&
+                  cpu_block_id_tensor.device().is_cpu() &&
+                  gpu_tensor_ptrs_tensor.device().is_cpu() &&
+                  cpu_tensor.device().is_cpu(),
+              "CE transfer metadata and CPU cache tensor must reside on CPU");
+  TORCH_CHECK(gpu_block_id_tensor.scalar_type() == torch::kInt64 &&
+                  cpu_block_id_tensor.scalar_type() == torch::kInt64 &&
+                  gpu_tensor_ptrs_tensor.scalar_type() == torch::kInt64,
+              "block-id and GPU pointer tensors must use int64");
+  TORCH_CHECK(gpu_block_id_tensor.is_contiguous() &&
+                  cpu_block_id_tensor.is_contiguous() &&
+                  gpu_tensor_ptrs_tensor.is_contiguous() &&
+                  cpu_tensor.is_contiguous(),
+              "CE transfer tensors must be contiguous");
+  TORCH_CHECK(gpu_block_id_tensor.numel() == cpu_block_id_tensor.numel(),
+              "GPU and CPU block-id tensors must have equal length");
+  TORCH_CHECK(start_layer_id >= 0 && num_layers > 0 &&
+                  chunk_size_in_bytes > 0 && gpu_kv_stride_in_bytes > 0 &&
+                  gpu_block_stride_in_bytes > 0 &&
+                  gpu_layer_stride_in_bytes > 0 &&
+                  cpu_kv_stride_in_bytes > 0 && cpu_layer_stride_in_bytes > 0 &&
+                  cpu_block_stride_in_bytes > 0,
+              "transfer strides, chunk size, and layer count must be positive");
+  TORCH_CHECK(ce_segment_threshold > 0 && ce_force_path >= -1 &&
+                  ce_force_path <= 4,
+              "invalid CE path configuration");
+  const int64_t kv_dim = is_mla ? 1 : 2;
+  TORCH_CHECK(chunk_size_in_bytes <=
+                  std::numeric_limits<int64_t>::max() / kv_dim,
+              "transfer size overflows int64");
+  const int64_t bytes_per_layer = kv_dim * chunk_size_in_bytes;
+  TORCH_CHECK(num_layers <=
+                  std::numeric_limits<int64_t>::max() / bytes_per_layer,
+              "transfer size overflows int64");
+  TORCH_CHECK(gpu_block_id_tensor.numel() <=
+                  std::numeric_limits<int>::max(),
+              "number of transfer blocks exceeds the supported range");
+#ifdef FLEXKV_CE_ONLY
+  TORCH_CHECK(use_ce_transfer,
+              "ROCm builds support only CE transfers; enable the CE transfer "
+              "configuration for this operation");
+  ce_enable_memcpy2d = false;
+#endif
+
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -83,6 +129,13 @@ void transfer_kv_blocks_binding(
     throw std::runtime_error("Unsupported gpu_block_type: " +
                              std::to_string(gpu_block_type));
   }
+  const int64_t required_tensor_ptrs =
+      backend_type == flexkv::BackendType::TRTLLM
+          ? 1
+          : static_cast<int64_t>(num_layers) *
+                (backend_type == flexkv::BackendType::SGLANG ? 2 : 1);
+  TORCH_CHECK(gpu_tensor_ptrs_tensor.numel() >= required_tensor_ptrs,
+              "gpu_tensor_ptrs_tensor is too small for the selected backend");
 
   // Build CE config from kwargs.
   flexkv::CETransferConfig ce_config;

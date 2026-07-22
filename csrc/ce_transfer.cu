@@ -7,6 +7,7 @@
  * selected by choose_path(). See ce_transfer.h and docs for the path taxonomy.
  */
 #include "ce_transfer.h"
+#include "rocm_utils.h"
 
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>

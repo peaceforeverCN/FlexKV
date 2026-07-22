@@ -18,7 +18,7 @@
 
 #include "ce_transfer.h"
 #include "gtensor_handler.cuh"
-#include <cuda_runtime.h>
+#include "rocm_utils.h"
 
 namespace flexkv {
 

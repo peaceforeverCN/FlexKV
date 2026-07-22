@@ -7,7 +7,7 @@
 #pragma once
 
 #include "gtensor_handler.cuh"
-#include <cuda_runtime.h>
+#include "rocm_utils.h"
 #include <torch/extension.h>
 #include <vector>
 

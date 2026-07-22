@@ -2,7 +2,6 @@
 #include <atomic>
 #include <cstdio>
 #include <fcntl.h>
-#include <nvtx3/nvToolsExt.h>
 #include <stdexcept>
 #include <sys/eventfd.h>
 #include <unistd.h>

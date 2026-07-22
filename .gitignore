@@ -87,6 +87,7 @@ ssd_cache*/
 
 .misc/
 .claude/
+.codebuddy/
 *cache*/
 benchmarks/nvcomp_benchmarks/inputs
 benchmarks/nvcomp_benchmarks/runs

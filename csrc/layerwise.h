@@ -1,11 +1,10 @@
 #pragma once
 
 #include <atomic>
-#include <cuda_runtime.h>
+#include "rocm_utils.h"
 #include <fcntl.h>
 #include <map>
 #include <memory>
-#include <nvtx3/nvToolsExt.h>
 #include <string>
 #include <sys/eventfd.h>
 #include <thread>
