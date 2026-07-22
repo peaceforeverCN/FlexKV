@@ -310,7 +310,7 @@ class TestLayerwiseWorkerDispatch(unittest.TestCase):
                          "fresh op must default to 0 (pure-counter semantics)")
 
         with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
-             patch('nvtx.start_range', return_value=MagicMock()):
+             patch('flexkv.common.tracing.nvtx.start_range', return_value=MagicMock()):
             engine._assign_op_to_worker(op)
 
         # Single matching sibling → exactly one submission → pending_count == 1.
@@ -332,7 +332,7 @@ class TestLayerwiseWorkerDispatch(unittest.TestCase):
         engine.op_id_to_op[op.op_id] = op
 
         with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
-             patch('nvtx.start_range', return_value=MagicMock()):
+             patch('flexkv.common.tracing.nvtx.start_range', return_value=MagicMock()):
             engine._assign_op_to_worker(op)
 
         # Exactly one replica was submitted (only one matching sibling).
@@ -408,7 +408,7 @@ class TestWorkerKeyRouting(unittest.TestCase):
                 engine.op_id_to_op[op.op_id] = op
 
                 with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
-                     patch('nvtx.start_range', return_value=MagicMock()):
+                     patch('flexkv.common.tracing.nvtx.start_range', return_value=MagicMock()):
                     engine._assign_op_to_worker(op)
 
                 # The targeted worker received exactly one replica
@@ -448,7 +448,7 @@ class TestWorkerKeyRouting(unittest.TestCase):
         engine.op_id_to_op[op.op_id] = op
 
         with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
-             patch('nvtx.start_range', return_value=MagicMock()):
+             patch('flexkv.common.tracing.nvtx.start_range', return_value=MagicMock()):
             with self.assertRaises(ValueError):
                 engine._assign_op_to_worker(op)
 
@@ -575,7 +575,7 @@ class TestPendingCountBookkeepingMatrix(unittest.TestCase):
 
     def _dispatch(self, engine, op):
         with patch('flexkv.transfer.transfer_engine.register_op_to_buffer'), \
-             patch('nvtx.start_range', return_value=MagicMock()):
+             patch('flexkv.common.tracing.nvtx.start_range', return_value=MagicMock()):
             engine._assign_op_to_worker(op)
 
     def _expected_submissions(self, engine) -> int:
