@@ -16,14 +16,29 @@ class cudaIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_byte * 64)]
 
 
-# Load CUDA runtime library
-try:
-    cudart = ctypes.CDLL("libcudart.so")
-except:
-    try:
-        cudart = ctypes.CDLL("libcudart.so.12")
-    except:
-        cudart = ctypes.CDLL("libcudart.so.11")
+# Load GPU runtime library (CUDA or ROCm/HIP)
+def _load_gpu_runtime():
+    if getattr(torch.version, "hip", None):
+        for lib in ("libamdhip64.so", "libamdhip64.so.6"):
+            try:
+                return ctypes.CDLL(lib)
+            except OSError:
+                continue
+        raise OSError("libamdhip64.so not found (ROCm runtime required)")
+    for lib in ("libcudart.so", "libcudart.so.12", "libcudart.so.11"):
+        try:
+            return ctypes.CDLL(lib)
+        except OSError:
+            continue
+    raise OSError("libcudart.so not found (CUDA runtime required)")
+
+cudart = _load_gpu_runtime()
+
+# Resolve a CUDA IPC symbol name to the HIP equivalent when running on ROCm.
+def _gpu_symbol(cuda_name: str, hip_name: str):
+    if getattr(torch.version, "hip", None):
+        return getattr(cudart, hip_name)
+    return getattr(cudart, cuda_name)
 
 # CUDA IPC handle size (64 bytes on Linux)
 CUDA_IPC_HANDLE_SIZE = 64
@@ -353,13 +368,14 @@ class TensorSharedHandle:
         # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
         ipc_handle = cudaIpcMemHandle_t()
 
-        # Call cudaIpcGetMemHandle
-        result = cudart.cudaIpcGetMemHandle(
+        # Call cudaIpcGetMemHandle / hipIpcGetMemHandle
+        result = _gpu_symbol("cudaIpcGetMemHandle", "hipIpcGetMemHandle")(
             ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
         )
 
         if result != cudaSuccess:
-            error_msg = f"cudaIpcGetMemHandle failed with error code {result} for device {device}, ptr={hex(data_ptr)}"
+            api = "hipIpcGetMemHandle" if getattr(torch.version, "hip", None) else "cudaIpcGetMemHandle"
+            error_msg = f"{api} failed with error code {result} for device {device}, ptr={hex(data_ptr)}"
             flexkv_logger.error(error_msg)
             raise RuntimeError(error_msg)
 
@@ -411,7 +427,7 @@ class TensorSharedHandle:
 
         # Open IPC memory handle to get base pointer
         base_ptr = ctypes.c_void_p()
-        result = cudart.cudaIpcOpenMemHandle(
+        result = _gpu_symbol("cudaIpcOpenMemHandle", "hipIpcOpenMemHandle")(
             ctypes.byref(base_ptr),
             handle,
             ctypes.c_int(1),  # cudaIpcMemLazyEnablePeerAccess = 1

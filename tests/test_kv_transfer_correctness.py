@@ -490,7 +490,7 @@ def spot_check_gpu(all_gpu, expected_gpu_id, num_gpus, num_layers, num_blocks,
 @pytest.mark.parametrize("data_config", MHA_SIZES)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
-@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=lambda v: "memcpy2d" if v else "no_memcpy2d")
 def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce, enable_memcpy2d):
     """Non-MLA round-trip: D2H -> clear GPU -> H2D -> verify per-rank data.
 
@@ -577,7 +577,7 @@ def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce, en
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 @pytest.mark.parametrize("mode", MLA_MODES)
-@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=lambda v: "memcpy2d" if v else "no_memcpy2d")
 def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, mode, enable_memcpy2d):
     """MLA round-trip with each D2H mode. Verifies K and V."""
     skip_if_engine_unsupported(use_ce)
@@ -1156,7 +1156,7 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
 @pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
                          ids=lambda t: "thr{}".format(t))
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
-@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=lambda v: "memcpy2d" if v else "no_memcpy2d")
 def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
                             path_opt, mode, segment_threshold, enable_memcpy2d):
     """CE strategy round-trip correctness via block-id patterns.
@@ -1277,7 +1277,7 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("notify_mode", ["polling"], ids=["polling"])
 @pytest.mark.parametrize("layer_granularity", [1, None], ids=["lg1", "lg_all"])
-@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=lambda v: "memcpy2d" if v else "no_memcpy2d")
 def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
                                 path_opt, mode, segment_threshold,
                                 notify_mode, layer_granularity, enable_memcpy2d):
