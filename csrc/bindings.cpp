@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "cache_utils.h"
+#include "ce_trace.h"
 #ifdef FLEXKV_ENABLE_GDS
 #include "gds/gds_manager.h"
 #include "gds/tp_gds_transfer_thread_group.h"
@@ -472,6 +473,29 @@ PYBIND11_MODULE(c_ext, m) {
         flexkv::monitoring::MetricsManager::Instance().Configure(enabled, port);
       },
       "Configure C++ metrics from Python", py::arg("enabled"), py::arg("port"));
+
+  // CE trace control — runtime toggle for structured transfer logging.
+  m.def(
+      "ce_trace_enabled",
+      []() { return flexkv::ce_trace_enabled(); },
+      "Check if CE transfer tracing is enabled");
+  m.def(
+      "ce_trace_set_enabled",
+      [](bool enabled) { flexkv::ce_trace_set_enabled(enabled); },
+      "Enable or disable CE transfer tracing at runtime",
+      py::arg("enabled"));
+  m.def(
+      "ce_trace_shutdown",
+      []() { flexkv::ce_trace_shutdown(); },
+      "Flush and shut down the CE trace logger (call before exit)");
+  m.def(
+      "ce_trace_file_path",
+      []() { return flexkv::ce_trace_file_path(); },
+      "Get the CE trace output file path");
+  m.def(
+      "ce_trace_max_blocks",
+      []() { return flexkv::ce_trace_max_blocks(); },
+      "Get the max block IDs logged per trace entry (0 = no limit)");
 
   m.def("transfer_kv_blocks", &transfer_kv_blocks_binding,
         "Transfer multi-layer KV-cache between CPU and GPU",

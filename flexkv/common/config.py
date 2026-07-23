@@ -776,6 +776,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
     trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
 
+    # CE transfer tracing: structured JSONL logging of H2D/D2H strategy
+    # selection. FLEXKV_CE_TRACE=1 enables C++ side logging (zero overhead
+    # when 0). FLEXKV_CE_TRACE_FILE sets the output path.
+    # FLEXKV_CE_TRACE_MAX_BLOCKS limits block-id array size (0 = no limit).
+    ce_trace_enable=bool(int(os.getenv('FLEXKV_CE_TRACE', 0))),
+    ce_trace_file=os.getenv('FLEXKV_CE_TRACE_FILE', './flexkv_ce_trace.jsonl'),
+    ce_trace_max_blocks=int(os.getenv('FLEXKV_CE_TRACE_MAX_BLOCKS', 256)),
+
     lt_pool_initial_capacity=int(os.getenv('FLEXKV_LT_POOL_INITIAL_CAPACITY', 10000000)),
     refresh_batch_size=int(os.getenv('FLEXKV_REFRESH_BATCH_SIZE', 256)),
     rebuild_interval_ms=int(os.getenv('FLEXKV_REBUILD_INTERVAL_MS', 2000)),

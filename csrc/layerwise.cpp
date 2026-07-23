@@ -969,6 +969,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
         "multi-group instance; use layerwise_transfer_multi_group() instead.");
   }
 
+  // Assign a new batch_id so all transfer_kv_blocks() calls within this
+  // layerwise batch share the same CE trace correlation ID.
+  ce_config_.batch_id++;
+
   // Finish and release polling state from the previous transfer before the
   // batch metadata below is replaced.
   stop_polling_();
@@ -1315,6 +1319,9 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         "[LayerwiseTransferGroup] layerwise_transfer_multi_group() invoked on "
         "a single-group instance; use layerwise_transfer() instead.");
   }
+
+  // Assign a new batch_id for multi-group layerwise batch correlation.
+  ce_config_.batch_id++;
 
   current_counter_id_ = counter_id;
   notify_mode_ = notify_mode == "polling" ? NotifyMode::POLLING

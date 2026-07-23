@@ -2,6 +2,7 @@
 
 #include <torch/extension.h>
 
+#include "ce_trace.h"
 #include "ce_transfer.h"
 #include "rocm_utils.h"
 
@@ -65,6 +66,17 @@ void transfer_kv_blocks(
       chunk_size_in_bytes, gpu_block_stride_in_bytes);
 
   if (!rocm_ce_config.path_opt_enabled) {
+    ce_trace_log(static_cast<int>(Type), is_host_to_device,
+                 num_blocks, start_layer_id, num_layers, is_mla, kv_dim,
+                 chunk_size_in_bytes,
+                 gpu_tensor_handler.gpu_kv_stride * (int64_t)sizeof(int64_t),
+                 gpu_block_stride_in_bytes,
+                 gpu_tensor_handler.gpu_layer_stride * (int64_t)sizeof(int64_t),
+                 cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+                 cpu_block_stride_in_bytes,
+                 gpu_startoff_inside_chunks, cpu_startoff_inside_chunks,
+                 rocm_ce_config, analysis, CEPath::PER_BLOCK,
+                 gpu_block_ids, cpu_block_ids);
     ce_transfer_per_block<Type>(
         num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids,
         gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
@@ -85,6 +97,18 @@ void transfer_kv_blocks(
       path = choose_path(analysis, rocm_ce_config, chunk_size_in_bytes,
                          is_host_to_device, is_full_block);
     }
+
+    ce_trace_log(static_cast<int>(Type), is_host_to_device,
+                 num_blocks, start_layer_id, num_layers, is_mla, kv_dim,
+                 chunk_size_in_bytes,
+                 gpu_tensor_handler.gpu_kv_stride * (int64_t)sizeof(int64_t),
+                 gpu_block_stride_in_bytes,
+                 gpu_tensor_handler.gpu_layer_stride * (int64_t)sizeof(int64_t),
+                 cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+                 cpu_block_stride_in_bytes,
+                 gpu_startoff_inside_chunks, cpu_startoff_inside_chunks,
+                 rocm_ce_config, analysis, path,
+                 gpu_block_ids, cpu_block_ids);
 
     switch (path) {
       case CEPath::CONTIG_DIRECT:

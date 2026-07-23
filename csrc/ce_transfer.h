@@ -27,6 +27,11 @@ struct CETransferConfig {
   bool is_blockfirst = false;
   // model uses MLA (kv_dim=1)
   bool is_mla = false;
+  // Layerwise batch correlation ID. Incremented at each layerwise_transfer()
+  // / layerwise_transfer_multi_group() call so all transfer_kv_blocks()
+  // invocations within one logical batch share the same value. Standalone
+  // transfer_kv_blocks() calls leave this at 0.
+  int64_t batch_id = 0;
 };
 enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
