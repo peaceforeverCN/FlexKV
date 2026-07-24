@@ -509,6 +509,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
         self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
         self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+        self.ce_kernel_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold
 
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
@@ -667,6 +668,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     -1,  # ce_force_path
                     self.ce_enable_memcpy2d,
                     self.cpu_is_blockfirst,
+                    self.ce_kernel_threshold,
                 )
         else:
             # Uniform transfer: single call (whole-model)
@@ -695,6 +697,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 -1,  # ce_force_path
                 self.ce_enable_memcpy2d,
                 self.cpu_is_blockfirst,
+                self.ce_kernel_threshold,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -867,6 +870,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
                 is_blockfirst=self.cpu_is_blockfirst,
                 is_mla=self.is_mla,
+                ce_kernel_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold,
             )
 
         self._compressor = compressor or NullCompressionStrategy()
@@ -982,6 +986,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
                 is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
                 is_mla=self.is_mla,
+                ce_kernel_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold,
             )
 
             self.tp_group_transfer_groups.append({

@@ -288,9 +288,9 @@ class CETraceReplayer:
         elif ce_force_path >= 0:
             path_names = [
                 "CONTIG_DIRECT", "SEGMENT_DIRECT", "SEGMENT_SCATTER",
-                "GATHER_SCATTER", "GATHER_DIRECT",
+                "GATHER_SCATTER", "GATHER_DIRECT", "COMPUTE_KERNEL",
             ]
-            replayed_path = path_names[ce_force_path] if ce_force_path <= 4 else "UNKNOWN"
+            replayed_path = path_names[ce_force_path] if ce_force_path <= 5 else "UNKNOWN"
         else:
             replayed_path = entry.ce_path
 
@@ -346,6 +346,7 @@ class CETraceReplayer:
                 ce_force_path=ce_force_path,
                 ce_enable_memcpy2d=entry.ce_config["enable_memcpy2d"],
                 is_blockfirst=entry.ce_config["is_blockfirst"],
+                ce_kernel_threshold=entry.ce_config.get("kernel_threshold", 0),
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -404,8 +405,8 @@ class CETraceReplayer:
         results = []
         # Original (auto-select)
         results.append(self.replay(entry_idx=entry_idx))
-        # Each forced path
-        for path_id in range(5):
+        # Each forced path (0-5: CONTIG_DIRECT..COMPUTE_KERNEL)
+        for path_id in range(6):
             r = self.replay(entry_idx=entry_idx, force_path=path_id)
             results.append(r)
         # PER_BLOCK baseline

@@ -221,8 +221,8 @@ void transfer_kv_blocks(
       // force_path: benchmark only
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 4,
-                    "force_path out of range [0,4]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 5,
+                    "force_path out of range [0,5]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         // is_full_block: all layers*kv_dim in one call (rank0_only).

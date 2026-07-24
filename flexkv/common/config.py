@@ -756,6 +756,15 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     enable_ce_memcpy2d=(bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1)))
                         and not _is_rocm_runtime()),
 
+    # Compute-kernel crossover threshold (bytes). BENCHMARK/DEBUG ONLY —
+    # default 0 keeps CE (SDMA). When >= this value, a HIP compute copy kernel
+    # replaces SDMA. Pure-transfer benchmarks show 1.3x speedup at num_blocks
+    # >= 24, but in real inference the compute kernel competes with attention/
+    # MLP kernels for CUs, destroying transfer/compute overlap. CE uses a
+    # dedicated copy engine and is correct for both D2H and H2D. See
+    # docs/hip_compute_kernel_perf.md.
+    transfer_kernel_threshold=int(os.getenv('FLEXKV_TRANSFER_KERNEL_THRESHOLD', 0)),
+
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
 
