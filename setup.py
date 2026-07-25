@@ -230,8 +230,37 @@ def get_version():
     except Exception:
         return "0.0.0+unknown"
 
+
+def get_git_commit():
+    commit = os.environ.get("FLEXKV_GIT_COMMIT") or os.environ.get("GITHUB_SHA")
+    if not commit:
+        import subprocess
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                stderr=subprocess.PIPE,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            ).decode().strip()
+        except Exception:
+            return "unknown"
+
+    commit = commit.strip().lower()
+    if not commit or any(char not in "0123456789abcdef" for char in commit):
+        return "unknown"
+    return commit[:12]
+
+
+build_git_commit = get_git_commit()
+
 build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
+
+spdlog_include_dir = os.path.abspath("third_party/spdlog/include")
+if not os.path.isdir(spdlog_include_dir):
+    raise RuntimeError(
+        "third_party/spdlog is missing; run "
+        "git submodule update --init third_party/spdlog"
+    )
 
 # Check if we're in debug mode using environment variable
 debug = os.environ.get("FLEXKV_DEBUG") == "1"
@@ -258,6 +287,7 @@ if IS_ROCM_BUILD:
 cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/ce_trace.cpp",
+    "csrc/logging.cpp",
     "csrc/ce_transfer_dispatch.cu" if IS_ROCM_BUILD else "csrc/transfer.cu",
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
@@ -270,6 +300,7 @@ cpp_sources = [
 ]
 
 hpp_sources = [
+    "csrc/logging.h",
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
@@ -315,7 +346,11 @@ else:
         os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
     print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
-extra_compile_args = ["-std=c++17", "-O3"]
+extra_compile_args = [
+    "-std=c++17",
+    "-O3",
+    f'-DFLEXKV_GIT_COMMIT="{build_git_commit}"',
+]
 if IS_ROCM_BUILD:
     extra_compile_args.extend(["-DFLEXKV_USE_ROCM", "-DFLEXKV_CE_ONLY"])
 if enable_metrics:
@@ -323,7 +358,7 @@ if enable_metrics:
 include_dirs = [
     os.path.abspath(os.path.join(build_dir, "include")),
     os.path.abspath("csrc"),
-    os.path.abspath("third_party/spdlog/include"),  # spdlog header-only
+    spdlog_include_dir,  # spdlog header-only
 ]
 
 # Add rpath to find libraries at runtime

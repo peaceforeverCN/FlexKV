@@ -27,20 +27,19 @@ struct CETransferConfig {
   bool is_blockfirst = false;
   // model uses MLA (kv_dim=1)
   bool is_mla = false;
-  // Layerwise batch correlation ID. Incremented at each layerwise_transfer()
+// Layerwise batch correlation ID. Incremented at each layerwise_transfer()
   // / layerwise_transfer_multi_group() call so all transfer_kv_blocks()
   // invocations within one logical batch share the same value. Standalone
   // transfer_kv_blocks() calls leave this at 0.
   int64_t batch_id = 0;
   // Compute-kernel crossover threshold in bytes (BENCHMARK/DEBUG ONLY).
   // When total transfer size >= this value, dispatch selects COMPUTE_KERNEL
-  // instead of SDMA. Pure-transfer benchmarks show 1.3x speedup at num_blocks
-  // >= 24, BUT in real inference the compute kernel competes with attention/
-  // MLP kernels for CUs, destroying transfer/compute overlap. CE (SDMA) uses
-  // a dedicated copy engine and is the correct choice for both D2H (async
-  // offload) and H2D (layerwise). Default 0 = keep CE. See
-  // docs/hip_compute_kernel_perf.md.
+  // instead of SDMA. Default 0 = keep CE. See docs/hip_compute_kernel_perf.md.
   int64_t kernel_threshold = 0;
+  // parallel CPU gather/scatter threads; 0=disable
+  int gather_threads = 4;
+  // NT store (AVX-512/AVX2 streaming store) for scatter/gather
+  bool gather_nt = true;
 };
 enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
@@ -178,7 +177,8 @@ void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
                     int64_t cpu_startoff_inside_chunks_int64,
                     int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
                     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-                    int start_layer_id, bool cpu_phys_contig);
+                    int start_layer_id, bool cpu_phys_contig,
+                    int gather_threads, bool gather_nt);
 
 void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
                      const int64_t *cpu_block_ids, int num_blocks,
@@ -186,6 +186,7 @@ void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
                      int64_t cpu_startoff_inside_chunks_int64,
                      int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
                      int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-                     int start_layer_id, bool cpu_phys_contig);
+                     int start_layer_id, bool cpu_phys_contig,
+                     int gather_threads, bool gather_nt);
 
 } // namespace flexkv

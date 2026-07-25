@@ -28,6 +28,11 @@
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
 #include "transfer_ssd.h"
+
+#ifndef FLEXKV_GIT_COMMIT
+#define FLEXKV_GIT_COMMIT "unknown"
+#endif
+
 #ifdef FLEXKV_ENABLE_P2P
 #include "dist/block_meta.h"
 #include "dist/distributed_radix_tree.h"
@@ -62,7 +67,8 @@ void transfer_kv_blocks_binding(
     bool ce_path_opt = false,
     int ce_segment_threshold = 8, int ce_force_path = -1,
     bool ce_enable_memcpy2d = false, bool is_blockfirst = false,
-    int64_t ce_kernel_threshold = 0) {
+    int64_t ce_kernel_threshold = 0,
+    int ce_gather_threads = 4, bool ce_gather_nt = true) {
   TORCH_CHECK(gpu_block_id_tensor.device().is_cpu() &&
                   cpu_block_id_tensor.device().is_cpu() &&
                   gpu_tensor_ptrs_tensor.device().is_cpu() &&
@@ -148,6 +154,8 @@ void transfer_kv_blocks_binding(
   ce_config.is_blockfirst = is_blockfirst;
   ce_config.is_mla = is_mla;
   ce_config.kernel_threshold = ce_kernel_threshold;
+  ce_config.gather_threads = ce_gather_threads;
+  ce_config.gather_nt = ce_gather_nt;
 
   // Create GTensorHandler
   flexkv::GTensorHandler handler(
@@ -468,6 +476,8 @@ bool create_gds_file_binding(GDSManager &manager, const std::string &filename,
 #endif
 
 PYBIND11_MODULE(c_ext, m) {
+  m.attr("__git_commit__") = FLEXKV_GIT_COMMIT;
+
   // Metrics configuration function - allows Python to configure C++ metrics
   m.def(
       "configure_cpp_metrics",
@@ -515,7 +525,9 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1,
         py::arg("ce_enable_memcpy2d") = false,
         py::arg("is_blockfirst") = false,
-        py::arg("ce_kernel_threshold") = 0);
+        py::arg("ce_kernel_threshold") = 0,
+        py::arg("ce_gather_threads") = 4,
+        py::arg("ce_gather_nt") = true);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -551,7 +563,9 @@ PYBIND11_MODULE(c_ext, m) {
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
                        bool is_mla,
-                       int64_t ce_kernel_threshold) {
+                       int64_t ce_kernel_threshold,
+                       int ce_gather_threads,
+                       bool ce_gather_nt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
@@ -560,6 +574,8 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
             cfg.kernel_threshold = ce_kernel_threshold;
+            cfg.gather_threads = ce_gather_threads;
+            cfg.gather_nt = ce_gather_nt;
              return new flexkv::LayerwiseTransferGroup(
                  num_gpus, gpu_blocks, cpu_blocks, ssd_files, num_layers,
                  gpu_kv_strides_tensor, gpu_block_strides_tensor,
@@ -594,7 +610,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ce_enable_memcpy2d") = false,
            py::arg("is_blockfirst") = false,
            py::arg("is_mla") = false,
-           py::arg("ce_kernel_threshold") = 0)
+           py::arg("ce_kernel_threshold") = 0,
+           py::arg("ce_gather_threads") = 4,
+           py::arg("ce_gather_nt") = true)
       .def(py::init([](
           int num_gpus,
           const std::vector<std::vector<std::vector<torch::Tensor>>>
@@ -630,7 +648,8 @@ PYBIND11_MODULE(c_ext, m) {
           torch::Tensor swa_gpu_chunk_sizes_tensor,
           int64_t ce_segment_threshold, bool ce_path_opt, int ce_force_path,
           bool ce_enable_memcpy2d, bool is_blockfirst, bool is_mla,
-          int64_t ce_kernel_threshold) {
+          int64_t ce_kernel_threshold,
+          int ce_gather_threads, bool ce_gather_nt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
@@ -639,6 +658,8 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
             cfg.kernel_threshold = ce_kernel_threshold;
+            cfg.gather_threads = ce_gather_threads;
+            cfg.gather_nt = ce_gather_nt;
             return new flexkv::LayerwiseTransferGroup(
                 num_gpus, gpu_blocks_per_group, cpu_blocks, ssd_files,
                 num_original_layers, layer_members, group_num_layers,
@@ -685,7 +706,9 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("ce_enable_memcpy2d") = false,
           py::arg("is_blockfirst") = false,
           py::arg("is_mla") = false,
-          py::arg("ce_kernel_threshold") = 0)
+          py::arg("ce_kernel_threshold") = 0,
+          py::arg("ce_gather_threads") = 4,
+          py::arg("ce_gather_nt") = true)
       .def("init_swa_multi_group",
            &flexkv::LayerwiseTransferGroup::init_swa_multi_group,
            py::arg("swa_gpu_blocks_per_group"), py::arg("swa_cpu_blocks"),
@@ -824,7 +847,9 @@ PYBIND11_MODULE(c_ext, m) {
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
                        bool is_mla,
-                       int64_t ce_kernel_threshold) {
+                       int64_t ce_kernel_threshold,
+                       int ce_gather_threads,
+                       bool ce_gather_nt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
@@ -833,6 +858,8 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
             cfg.kernel_threshold = ce_kernel_threshold;
+            cfg.gather_threads = ce_gather_threads;
+            cfg.gather_nt = ce_gather_nt;
              return new flexkv::TPTransferThreadGroup(
                  num_gpus, gpu_block_ptrs_flat, num_tensors_per_gpu,
                  cpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes,
@@ -856,7 +883,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ce_enable_memcpy2d") = false,
            py::arg("is_blockfirst") = false,
            py::arg("is_mla") = false,
-           py::arg("ce_kernel_threshold") = 0)
+           py::arg("ce_kernel_threshold") = 0,
+           py::arg("ce_gather_threads") = 4,
+           py::arg("ce_gather_nt") = true)
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),

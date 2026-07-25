@@ -758,7 +758,9 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
     transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
+    ce_segment_threshold=int(os.getenv('FLEXKV_CE_SEGMENT_THRESHOLD', 8)),
     transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
+    ce_path_opt=bool(int(os.getenv('FLEXKV_CE_PATH_OPT', 1))),
     enable_ce_memcpy2d=(bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1)))
                         and not _is_rocm_runtime()),
 
@@ -770,6 +772,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # dedicated copy engine and is correct for both D2H and H2D. See
     # docs/hip_compute_kernel_perf.md.
     transfer_kernel_threshold=int(os.getenv('FLEXKV_TRANSFER_KERNEL_THRESHOLD', 0)),
+
+    # parallel CPU gather/scatter threads; 0=disable
+    ce_gather_threads=int(os.getenv('FLEXKV_CE_GATHER_THREADS', 4)),
+    # NT store (AVX-512/AVX2 streaming store) for scatter/gather
+    ce_gather_nt=bool(int(os.getenv('FLEXKV_CE_GATHER_NT', 1))),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),

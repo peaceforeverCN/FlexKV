@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import os
 import copy
 
@@ -278,39 +279,56 @@ class TransferWorkerBase(ABC):
                                   start_time: float,
                                   end_time: float,
                                   uncompressed_size: Optional[int] = None) -> None:
-        """Common method to log transfer performance"""
-        size_text = (
-            f"comp_ratio: {uncompressed_size / transfer_size:.3f}x "
-            f"comp_size: {transfer_size / (1024 * 1024 * 1024):.3f} GB "
-            f"uncomp_size: {uncompressed_size / (1024 * 1024 * 1024):.3f} GB "
-            if uncompressed_size is not None and transfer_size > 0
-            else f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
+        """Emit one terminal record per transfer op."""
+        if not flexkv_logger.is_enabled_for(logging.INFO):
+            return
+        duration_s = max(end_time - start_time, 1e-9)
+        is_layerwise = transfer_op.transfer_type == TransferType.LAYERWISE
+        direction = "H2D" if is_layerwise else transfer_op.transfer_type.value
+        blocks = (
+            len(transfer_op.src_block_ids_h2d)
+            if is_layerwise
+            else transfer_op.valid_block_num
         )
-        flexkv_logger.info(
-            f"[FlexKV-IO] direction={self._io_direction(transfer_op.transfer_type)} "
-            f"path={self._io_path(transfer_op.transfer_type)} phase=complete "
-            f"request_id={transfer_op.transfer_op_id} "
-            f"graph_id={transfer_op.transfer_graph_id} bytes={transfer_size} "
-            f"{transfer_op.transfer_type.name} transfer request: "
-            f"{transfer_op.transfer_op_id} finished "
-            f"{size_text}"
-            f"transfer time: {end_time - start_time:.4f} s "
-            f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
-        )
+        transfer_mode = "layerwise" if is_layerwise else "no-layerwise"
+        bandwidth = transfer_size / duration_s / 1e9
 
-    @staticmethod
-    def _io_direction(transfer_type: TransferType) -> str:
-        if transfer_type in (TransferType.H2D, TransferType.LAYERWISE):
-            return "H2D"
-        if transfer_type == TransferType.D2H:
-            return "D2H"
-        return transfer_type.name
-
-    @staticmethod
-    def _io_path(transfer_type: TransferType) -> str:
-        if transfer_type == TransferType.LAYERWISE:
-            return "layerwise"
-        return "bulk"
+        if (
+            uncompressed_size is not None
+            and transfer_size > 0
+            and uncompressed_size != transfer_size
+        ):
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=transfer act=complete status=success "
+                "direction=%s blocks=%d op_id=%d graph_id=%d mode=%s "
+                "compressed_size=%.6gGB original_size=%.6gGB "
+                "compression_ratio=%.2fx transfer_time=%.4fs "
+                "bandwidth=%.2fGB/s",
+                direction,
+                blocks,
+                transfer_op.transfer_op_id,
+                transfer_op.transfer_graph_id,
+                transfer_mode,
+                transfer_size / (1024**3),
+                uncompressed_size / (1024**3),
+                uncompressed_size / transfer_size,
+                duration_s,
+                bandwidth,
+            )
+        else:
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=transfer act=complete status=success "
+                "direction=%s blocks=%d op_id=%d graph_id=%d mode=%s "
+                "data_size=%.6gGB transfer_time=%.4fs bandwidth=%.2fGB/s",
+                direction,
+                blocks,
+                transfer_op.transfer_op_id,
+                transfer_op.transfer_graph_id,
+                transfer_mode,
+                transfer_size / (1024**3),
+                duration_s,
+                bandwidth,
+            )
 
     @abstractmethod
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -340,15 +358,39 @@ class TransferWorkerBase(ABC):
                         batch_ops.append(op)
                     for op in batch_ops:
                         transfer_status = False
+                        transfer_start_ns = time.perf_counter_ns()
+                        nvtx_pushed = False
                         try:
                             nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                                 f"graph_id: {op.transfer_graph_id}",
                                                 color=get_nvtx_range_color(op.transfer_graph_id))
+                            nvtx_pushed = True
                             transfer_status = self.launch_transfer(op)
-                            nvtx.pop_range()
                         except Exception as e:
-                            flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                        f"Failed transfer op: {op}")
+                            is_layerwise = op.transfer_type == TransferType.LAYERWISE
+                            direction = "H2D" if is_layerwise else op.transfer_type.value
+                            blocks = (
+                                len(op.src_block_ids_h2d)
+                                if is_layerwise
+                                else op.valid_block_num
+                            )
+                            flexkv_logger.error(
+                                "[FlexKV-IO] operation=transfer act=complete "
+                                "status=failed direction=%s blocks=%d op_id=%d "
+                                "graph_id=%d mode=%s transfer_time=%.4fs "
+                                "error=%r",
+                                direction,
+                                blocks,
+                                op.transfer_op_id,
+                                op.transfer_graph_id,
+                                "layerwise" if is_layerwise else "no-layerwise",
+                                (time.perf_counter_ns() - transfer_start_ns) / 1e9,
+                                str(e),
+                                exc_info=True,
+                            )
+                        finally:
+                            if nvtx_pushed:
+                                nvtx.pop_range()
                         if transfer_status:
                             ## only put the op when transfer success
                             self.finished_ops_queue.put(op.transfer_op_id)
@@ -506,8 +548,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
-        self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+        self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
+        self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
         self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
         self.ce_kernel_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold
 
@@ -865,12 +907,14 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 self.gpu_layer_strides_in_bytes,
                 self.gpu_chunk_sizes_in_bytes,
                 gpu_device_ids,
-                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
                 is_blockfirst=self.cpu_is_blockfirst,
                 is_mla=self.is_mla,
                 ce_kernel_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold,
+                ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+                ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             )
 
         self._compressor = compressor or NullCompressionStrategy()
@@ -981,8 +1025,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 gpu_layer_strides,
                 gpu_chunk_sizes,
                 gpu_device_ids,
-                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
                 is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
                 is_mla=self.is_mla,
