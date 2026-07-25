@@ -2,6 +2,7 @@
 
 #include <torch/extension.h>
 
+#include "ce_trace.h"
 #include "ce_transfer.h"
 #include "rocm_utils.h"
 
@@ -65,6 +66,17 @@ void transfer_kv_blocks(
       chunk_size_in_bytes, gpu_block_stride_in_bytes);
 
   if (!rocm_ce_config.path_opt_enabled) {
+    ce_trace_log(static_cast<int>(Type), is_host_to_device,
+                 num_blocks, start_layer_id, num_layers, is_mla, kv_dim,
+                 chunk_size_in_bytes,
+                 gpu_tensor_handler.gpu_kv_stride * (int64_t)sizeof(int64_t),
+                 gpu_block_stride_in_bytes,
+                 gpu_tensor_handler.gpu_layer_stride * (int64_t)sizeof(int64_t),
+                 cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+                 cpu_block_stride_in_bytes,
+                 gpu_startoff_inside_chunks, cpu_startoff_inside_chunks,
+                 rocm_ce_config, analysis, CEPath::PER_BLOCK,
+                 gpu_block_ids, cpu_block_ids);
     ce_transfer_per_block<Type>(
         num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids,
         gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
@@ -74,8 +86,8 @@ void transfer_kv_blocks(
   } else {
     CEPath path;
     if (rocm_ce_config.force_path >= 0) {
-      TORCH_CHECK(rocm_ce_config.force_path <= 4,
-                  "force_path out of range [0,4]: ",
+      TORCH_CHECK(rocm_ce_config.force_path <= 5,
+                  "force_path out of range [0,5]: ",
                   rocm_ce_config.force_path);
       path = static_cast<CEPath>(rocm_ce_config.force_path);
     } else {
@@ -84,7 +96,35 @@ void transfer_kv_blocks(
           cpu_block_stride_in_bytes;
       path = choose_path(analysis, rocm_ce_config, chunk_size_in_bytes,
                          is_host_to_device, is_full_block);
+      // Compute-kernel bypass (BENCHMARK/DEBUG ONLY — disabled by default):
+      // When total_bytes >= kernel_threshold, switch to a single HIP compute
+      // copy kernel. Pure-transfer benchmarks show 1.3x speedup at num_blocks
+      // >= 24, BUT in real inference this path competes with attention/MLP
+      // compute kernels for CUs, destroying the transfer/compute overlap that
+      // CE (SDMA, dedicated copy engine) provides for both D2H (async offload)
+      // and H2D (layerwise). Default kernel_threshold=0 keeps CE. See
+      // docs/hip_compute_kernel_perf.md for the full analysis.
+      if (rocm_ce_config.kernel_threshold > 0) {
+        const int64_t total_bytes =
+            static_cast<int64_t>(num_blocks) * num_layers * kv_dim *
+            chunk_size_in_bytes;
+        if (total_bytes >= rocm_ce_config.kernel_threshold) {
+          path = CEPath::COMPUTE_KERNEL;
+        }
+      }
     }
+
+    ce_trace_log(static_cast<int>(Type), is_host_to_device,
+                 num_blocks, start_layer_id, num_layers, is_mla, kv_dim,
+                 chunk_size_in_bytes,
+                 gpu_tensor_handler.gpu_kv_stride * (int64_t)sizeof(int64_t),
+                 gpu_block_stride_in_bytes,
+                 gpu_tensor_handler.gpu_layer_stride * (int64_t)sizeof(int64_t),
+                 cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+                 cpu_block_stride_in_bytes,
+                 gpu_startoff_inside_chunks, cpu_startoff_inside_chunks,
+                 rocm_ce_config, analysis, path,
+                 gpu_block_ids, cpu_block_ids);
 
     switch (path) {
       case CEPath::CONTIG_DIRECT:
@@ -130,6 +170,14 @@ void transfer_kv_blocks(
             cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
             chunk_size_in_bytes, stream, is_host_to_device, analysis,
             rocm_ce_config);
+        break;
+      case CEPath::COMPUTE_KERNEL:
+        ce_compute_kernel_transfer<Type>(
+            num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids,
+            gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
+            cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
+            cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+            chunk_size_in_bytes, stream, is_host_to_device);
         break;
     }
   }

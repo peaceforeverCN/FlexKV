@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include "ce_trace.h"
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
 #include "ce_transfer.h"
@@ -198,6 +199,17 @@ void transfer_kv_blocks(
 
     // path_opt_enabled off → PER_BLOCK; else choose_path() picks a strategy.
     if (!ce_config.path_opt_enabled) {
+      ce_trace_log(static_cast<int>(Type), is_host_to_device,
+                   num_blocks, start_layer_id, num_layers, is_mla, kv_dim,
+                   chunk_size_in_bytes,
+                   gpu_tensor_handler.gpu_kv_stride * (int64_t)sizeof(int64_t),
+                   gpu_block_stride_in_bytes,
+                   gpu_tensor_handler.gpu_layer_stride * (int64_t)sizeof(int64_t),
+                   cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+                   cpu_block_stride_in_bytes,
+                   gpu_startoff_inside_chunks, cpu_startoff_inside_chunks,
+                   ce_config, analysis, CEPath::PER_BLOCK,
+                   gpu_block_ids, cpu_block_ids);
       ce_transfer_per_block<Type>(
           num_blocks, start_layer_id, num_layers, kv_dim,
           gpu_block_ids, gpu_tensor_handler,
@@ -209,8 +221,8 @@ void transfer_kv_blocks(
       // force_path: benchmark only
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 4,
-                    "force_path out of range [0,4]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 5,
+                    "force_path out of range [0,5]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         // is_full_block: all layers*kv_dim in one call (rank0_only).
@@ -220,6 +232,18 @@ void transfer_kv_blocks(
         path = choose_path(analysis, ce_config, chunk_size_in_bytes,
                            is_host_to_device, is_full_block);
       }
+
+      ce_trace_log(static_cast<int>(Type), is_host_to_device,
+                   num_blocks, start_layer_id, num_layers, is_mla, kv_dim,
+                   chunk_size_in_bytes,
+                   gpu_tensor_handler.gpu_kv_stride * (int64_t)sizeof(int64_t),
+                   gpu_block_stride_in_bytes,
+                   gpu_tensor_handler.gpu_layer_stride * (int64_t)sizeof(int64_t),
+                   cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+                   cpu_block_stride_in_bytes,
+                   gpu_startoff_inside_chunks, cpu_startoff_inside_chunks,
+                   ce_config, analysis, path,
+                   gpu_block_ids, cpu_block_ids);
 
       switch (path) {
         case CEPath::CONTIG_DIRECT:

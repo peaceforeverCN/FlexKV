@@ -6,6 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+# ROCm hipify generated files
+*_hip.cpp
+*_hip.h
+*_hip.cuh
+*.hip
+
 # Distribution / packaging
 .Python
 build/

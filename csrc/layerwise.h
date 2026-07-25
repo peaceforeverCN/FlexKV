@@ -2,9 +2,14 @@
 
 #include <atomic>
 #include "rocm_utils.h"
+#include <condition_variable>
 #include <fcntl.h>
+#include <functional>
+#include <future>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <sys/eventfd.h>
 #include <thread>
@@ -314,17 +319,18 @@ private:
       torch::Tensor swa_gpu_chunk_sizes_tensor, int num_layers,
       int iouring_entries, int iouring_flags);
 
-  void launch_swa_h2d_layer_(
-      int start_layer, int layers_this_batch, int num_blocks,
+  // ---- per-GPU SWA launch fragments (Phase 1) ----
+  // Same work as launch_swa_*_h2d_layer_ but scoped to a single GPU ``d``,
+  // intended to run inside the per-GPU pinned worker task (no cudaSetDevice).
+  void launch_swa_h2d_for_gpu_(
+      int d, int start_layer, int layers_this_batch, int num_blocks,
       int64_t *swa_gpu_block_ids, int64_t *swa_cpu_block_ids,
       int64_t swa_h2d_cpu_kv_stride_in_bytes,
       int64_t swa_h2d_cpu_layer_stride_in_bytes,
       int64_t swa_cpu_block_stride_in_bytes, int transfer_cta_num,
       bool use_ce_transfer);
-
-  // Per-original-layer H2D for heterogeneous SWA/state groups.
-  void launch_swa_mg_h2d_layer_(
-      int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
+  void launch_swa_mg_h2d_for_gpu_(
+      int d, int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
       int64_t *swa_cpu_block_ids, int transfer_cta_num, bool use_ce_transfer,
       bool is_mla, const std::string &mla_d2h_mode);
 
@@ -352,6 +358,21 @@ private:
   void notify_layer_batch(int start_layer, int layers_this_batch);
   void event_polling_loop();
   void stop_polling_();
+
+  // ===== per-GPU pinned worker pool (Phase 1) =====
+  // Mirrors TPTransferThreadGroup: one resident worker per GPU, each
+  // cudaSetDevice(id) once at startup; the per-layer H2D hot path enqueues
+  // work via enqueue_for_gpu so the calling thread no longer toggles device.
+  using GpuTask = std::function<void()>;
+  std::vector<std::thread> gpu_workers_;
+  std::vector<std::queue<GpuTask>> gpu_queues_;
+  std::vector<std::mutex> gpu_mtxs_;
+  std::vector<std::condition_variable> gpu_cvs_;
+  std::atomic<bool> stop_gpu_pool_{false};
+
+  void start_gpu_pool_();      // spawn workers (call once, after streams_ built)
+  void shutdown_gpu_pool_();   // set stop, notify, join (before destroying streams_)
+  std::future<void> enqueue_for_gpu(int gpu_idx, GpuTask task);
 };
 
 } // namespace flexkv

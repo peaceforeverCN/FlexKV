@@ -762,6 +762,15 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     enable_ce_memcpy2d=(bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1)))
                         and not _is_rocm_runtime()),
 
+    # Compute-kernel crossover threshold (bytes). BENCHMARK/DEBUG ONLY —
+    # default 0 keeps CE (SDMA). When >= this value, a HIP compute copy kernel
+    # replaces SDMA. Pure-transfer benchmarks show 1.3x speedup at num_blocks
+    # >= 24, but in real inference the compute kernel competes with attention/
+    # MLP kernels for CUs, destroying transfer/compute overlap. CE uses a
+    # dedicated copy engine and is correct for both D2H and H2D. See
+    # docs/hip_compute_kernel_perf.md.
+    transfer_kernel_threshold=int(os.getenv('FLEXKV_TRANSFER_KERNEL_THRESHOLD', 0)),
+
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
 
@@ -781,6 +790,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
     trace_max_files=int(os.getenv('FLEXKV_TRACE_MAX_FILES', 5)),
     trace_flush_interval_ms=int(os.getenv('FLEXKV_TRACE_FLUSH_INTERVAL_MS', 1000)),
+
+    # CE transfer tracing: structured JSONL logging of H2D/D2H strategy
+    # selection. FLEXKV_CE_TRACE=1 enables C++ side logging (zero overhead
+    # when 0). FLEXKV_CE_TRACE_FILE sets the output path.
+    # FLEXKV_CE_TRACE_MAX_BLOCKS limits block-id array size (0 = no limit).
+    ce_trace_enable=bool(int(os.getenv('FLEXKV_CE_TRACE', 0))),
+    ce_trace_file=os.getenv('FLEXKV_CE_TRACE_FILE', './flexkv_ce_trace.jsonl'),
+    ce_trace_max_blocks=int(os.getenv('FLEXKV_CE_TRACE_MAX_BLOCKS', 256)),
 
     lt_pool_initial_capacity=int(os.getenv('FLEXKV_LT_POOL_INITIAL_CAPACITY', 10000000)),
     refresh_batch_size=int(os.getenv('FLEXKV_REFRESH_BATCH_SIZE', 256)),

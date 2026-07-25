@@ -257,6 +257,7 @@ if IS_ROCM_BUILD:
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
     "csrc/bindings.cpp",
+    "csrc/ce_trace.cpp",
     "csrc/ce_transfer_dispatch.cu" if IS_ROCM_BUILD else "csrc/transfer.cu",
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
@@ -276,6 +277,7 @@ hpp_sources = [
     "csrc/eviction_strategy.h",
     "csrc/layerwise.h",
     "csrc/ce_transfer.h",
+    "csrc/ce_trace.h",
     "csrc/rocm_utils.h",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
@@ -321,6 +323,7 @@ if enable_metrics:
 include_dirs = [
     os.path.abspath(os.path.join(build_dir, "include")),
     os.path.abspath("csrc"),
+    os.path.abspath("third_party/spdlog/include"),  # spdlog header-only
 ]
 
 # Add rpath to find libraries at runtime
