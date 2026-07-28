@@ -20,10 +20,11 @@
 #ifdef FLEXKV_ENABLE_NVCOMP
 #include "compression/ans/nvcomp_ans_tp.h"
 #endif
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 
 namespace flexkv {
 
@@ -184,14 +185,29 @@ void TPTransferThreadGroup::tp_group_transfer(
     const std::string &mla_d2h_mode,
     const int designated_rank) {
 
-  std::atomic<bool> failed{false};
-  std::string error_msg;
-  // threads_.clear();
-  // threads_.reserve(num_gpus_);
-
-  // Barrier sync_point(num_gpus_);
-  std::vector<std::future<void>> futures;
+  // Each GPU owns one error slot, so worker threads never mutate the same
+  // std::string concurrently. Futures are tagged with their GPU so every
+  // submitted task can be drained before an aggregated error is raised.
+  std::vector<std::string> gpu_errors(num_gpus_);
+  std::vector<std::pair<int, std::future<void>>> futures;
   futures.reserve(num_gpus_);
+  auto append_gpu_error = [&](int gpu, const std::string &message) {
+    std::string &slot = gpu_errors[gpu];
+    if (!slot.empty()) {
+      slot += "; ";
+    }
+    slot += message;
+  };
+  auto enqueue_task = [&](int gpu, Task task) {
+    try {
+      auto future = enqueue_for_gpu(gpu, std::move(task));
+      futures.emplace_back(gpu, std::move(future));
+    } catch (const std::exception &e) {
+      append_gpu_error(gpu, "enqueue failed: " + std::string(e.what()));
+    } catch (...) {
+      append_gpu_error(gpu, "enqueue failed: unknown exception");
+    }
+  };
 
   // Validate mla_d2h_mode parameter (only meaningful for MLA)
   std::string mode = mla_d2h_mode;
@@ -233,9 +249,9 @@ void TPTransferThreadGroup::tp_group_transfer(
     if (is_mla && !is_host_to_device && (mode == "rank0_only" || mode == "rank_rotate")
         && i != eff_designated_rank) {
       // Skip D2H transfer for non-designated GPUs
-      futures.emplace_back(enqueue_for_gpu(i, [i]() {
+      enqueue_task(i, [i]() {
         // Empty task - non-designated GPUs do nothing in rank0_only D2H mode
-      }));
+      });
       continue;
     }
 
@@ -247,12 +263,12 @@ void TPTransferThreadGroup::tp_group_transfer(
       int my_count_rotate = (i < remainder_rotate) ? (layers_per_rank_rotate + 1)
                                            : layers_per_rank_rotate;
       if (my_count_rotate == 0) {
-        futures.emplace_back(enqueue_for_gpu(i, [i]() {}));
+        enqueue_task(i, [i]() {});
         continue;
       }
     }
 
-    futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
+    enqueue_task(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
 
@@ -334,22 +350,40 @@ void TPTransferThreadGroup::tp_group_transfer(
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-          failed = true;
-          error_msg = cudaGetErrorString(err);
+          append_gpu_error(i, cudaGetErrorString(err));
         }
       } catch (const std::exception &e) {
-        failed = true;
-        error_msg = e.what();
+        append_gpu_error(i, e.what());
+      } catch (...) {
+        append_gpu_error(i, "unknown worker exception");
       }
-    }));
+    });
   }
 
-  for (auto &f : futures) {
-    f.get();
+  for (auto &entry : futures) {
+    try {
+      entry.second.get();
+    } catch (const std::exception &e) {
+      append_gpu_error(entry.first,
+                       "worker future failed: " + std::string(e.what()));
+    } catch (...) {
+      append_gpu_error(entry.first, "worker future failed: unknown exception");
+    }
   }
 
-  if (failed) {
-    throw std::runtime_error("tp_group_transfer failed: " + error_msg);
+  std::string combined_error;
+  for (int gpu = 0; gpu < num_gpus_; ++gpu) {
+    if (gpu_errors[gpu].empty()) {
+      continue;
+    }
+    if (!combined_error.empty()) {
+      combined_error += "; ";
+    }
+    combined_error +=
+        "GPU " + std::to_string(gpu_device_ids_[gpu]) + ": " + gpu_errors[gpu];
+  }
+  if (!combined_error.empty()) {
+    throw std::runtime_error("tp_group_transfer failed: " + combined_error);
   }
 }
 

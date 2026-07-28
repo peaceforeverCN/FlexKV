@@ -6,8 +6,62 @@
 #include <stdexcept>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <utility>
 
 namespace flexkv {
+namespace {
+
+using GpuFuture = std::pair<int, std::future<void>>;
+
+void append_gpu_error(std::vector<std::string> &errors, int gpu,
+                      const std::string &message) {
+  // A worker only writes its own slot. The caller drains that worker's future
+  // before the main thread can append a future error to the same slot.
+  std::string &slot = errors[gpu];
+  if (!slot.empty()) {
+    slot += "; ";
+  }
+  slot += message;
+}
+
+void drain_gpu_futures(std::vector<GpuFuture> &futures,
+                       std::vector<std::string> &errors) {
+  // Never stop at the first exception: all accepted GPU tasks may reference
+  // call-scoped tensors and must finish before this function returns.
+  for (auto &entry : futures) {
+    try {
+      entry.second.get();
+    } catch (const std::exception &error) {
+      append_gpu_error(errors, entry.first,
+                       "worker future failed: " + std::string(error.what()));
+    } catch (...) {
+      append_gpu_error(errors, entry.first,
+                       "worker future failed: unknown exception");
+    }
+  }
+}
+
+void throw_if_gpu_errors(const char *operation,
+                         const std::vector<int> &device_ids,
+                         const std::vector<std::string> &errors) {
+  std::string combined_error;
+  for (int gpu = 0; gpu < static_cast<int>(errors.size()); ++gpu) {
+    if (errors[gpu].empty()) {
+      continue;
+    }
+    if (!combined_error.empty()) {
+      combined_error += "; ";
+    }
+    combined_error +=
+        "GPU " + std::to_string(device_ids[gpu]) + ": " + errors[gpu];
+  }
+  if (!combined_error.empty()) {
+    throw std::runtime_error(std::string(operation) +
+                             " failed: " + combined_error);
+  }
+}
+
+} // namespace
 
 // ===== Event polling notification (#199) =====
 
@@ -1095,19 +1149,32 @@ void LayerwiseTransferGroup::layerwise_transfer(
     }
     // Create per-GPU poll events on each pinned worker (bound device): avoids
     // O(batches * num_gpus) cudaSetDevice from the main thread.
-    std::vector<std::future<void>> ev_futures;
+    std::vector<std::string> event_errors(num_gpus_);
+    std::vector<GpuFuture> ev_futures;
     ev_futures.reserve(num_gpus_);
     for (int g = 0; g < num_gpus_; ++g) {
-      ev_futures.emplace_back(enqueue_for_gpu(g, [this, g, num_batches]() {
-        for (int b = 0; b < num_batches; ++b) {
-          cudaEventCreateWithFlags(&poll_batches_[b].per_gpu_events[g],
-                                   cudaEventDisableTiming);
-        }
-      }));
+      try {
+        auto future = enqueue_for_gpu(g, [this, g, num_batches]() {
+          for (int b = 0; b < num_batches; ++b) {
+            const cudaError_t status = cudaEventCreateWithFlags(
+                &poll_batches_[b].per_gpu_events[g], cudaEventDisableTiming);
+            if (status != cudaSuccess) {
+              throw std::runtime_error("cudaEventCreateWithFlags failed: " +
+                                       std::string(cudaGetErrorString(status)));
+            }
+          }
+        });
+        ev_futures.emplace_back(g, std::move(future));
+      } catch (const std::exception &error) {
+        append_gpu_error(event_errors, g,
+                         "enqueue failed: " + std::string(error.what()));
+      } catch (...) {
+        append_gpu_error(event_errors, g, "enqueue failed: unknown exception");
+      }
     }
-    for (auto &f : ev_futures) {
-      f.get();
-    }
+    drain_gpu_futures(ev_futures, event_errors);
+    throw_if_gpu_errors("layerwise event creation", gpu_device_ids_,
+                        event_errors);
   }
 
   if (log_timing) {
@@ -1219,107 +1286,110 @@ void LayerwiseTransferGroup::layerwise_transfer(
     // Step 1: CPU -> GPU transfer — dispatch per-GPU work to the pinned
     // worker pool. Each worker is already bound to its GPU, so the hot path
     // no longer calls cudaSetDevice per layer/GPU.
-    std::atomic<bool> failed{false};
-    std::string error_msg;
-    std::vector<std::future<void>> futures;
+    std::vector<std::string> gpu_errors(num_gpus_);
+    std::vector<GpuFuture> futures;
     futures.reserve(num_gpus_);
     for (int i = 0; i < num_gpus_; ++i) {
-      futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
-        try {
-          int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-          int64_t gpu_startoff_inside_chunks = 0;
-          int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
+      try {
+        auto future = enqueue_for_gpu(i, [&, i]() {
+          try {
+            int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
+            int64_t gpu_startoff_inside_chunks = 0;
+            int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
 
-          // Handle MLA D2H mode for H2D transfer (#192, inlined logic).
-          if (is_mla) {
-            if (mla_mode == "sharded") {
-              cpu_startoff_inside_chunks = 0;
-              gpu_startoff_inside_chunks = 0;
-            } else if (mla_mode == "all_write") {
-              // Each rank's complete KV occupies num_blocks blocks on CPU.
-              // Use cpu_block_stride (not gpu_chunk_size) because BLOCKFIRST's
-              // block_stride includes all layers+kv_dims, while LAYERFIRST's
-              // block_stride == chunk_size (same result).
-              cpu_startoff_inside_chunks =
-                  i * num_blocks * cpu_block_stride_in_bytes;
-              gpu_startoff_inside_chunks = 0;
-            } else if (mla_mode == "rank0_only") {
-              cpu_startoff_inside_chunks = 0;
-              gpu_startoff_inside_chunks = 0;
+            // Handle MLA D2H mode for H2D transfer (#192, inlined logic).
+            if (is_mla) {
+              if (mla_mode == "sharded") {
+                cpu_startoff_inside_chunks = 0;
+                gpu_startoff_inside_chunks = 0;
+              } else if (mla_mode == "all_write") {
+                // Each rank's complete KV occupies num_blocks blocks on CPU.
+                // Use cpu_block_stride (not gpu_chunk_size) because
+                // BLOCKFIRST's block_stride includes all layers+kv_dims, while
+                // LAYERFIRST's block_stride == chunk_size (same result).
+                cpu_startoff_inside_chunks =
+                    i * num_blocks * cpu_block_stride_in_bytes;
+                gpu_startoff_inside_chunks = 0;
+              } else if (mla_mode == "rank0_only") {
+                cpu_startoff_inside_chunks = 0;
+                gpu_startoff_inside_chunks = 0;
+              }
             }
-          }
 
-          switch (backend_type_) {
-          case BackendType::VLLM:
-            flexkv::transfer_kv_blocks<BackendType::VLLM>(
-                num_blocks, start_layer, layers_this_batch, gpu_block_ids,
-                gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
-                cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
-                h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-                cpu_startoff_inside_chunks, chunk_size, streams_[i],
-                transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
-                is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
-                ce_config_);
-            break;
-          case BackendType::TRTLLM:
-            flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-                num_blocks, start_layer, layers_this_batch, gpu_block_ids,
-                gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
-                cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
-                h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-                cpu_startoff_inside_chunks, chunk_size, streams_[i],
-                transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
-                is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
-                ce_config_);
-            break;
-          case BackendType::SGLANG:
-            flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-                num_blocks, start_layer, layers_this_batch, gpu_block_ids,
-                gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
-                cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
-                h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-                cpu_startoff_inside_chunks, chunk_size, streams_[i],
-                transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
-                is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
-                ce_config_);
-            break;
-          }
+            switch (backend_type_) {
+            case BackendType::VLLM:
+              flexkv::transfer_kv_blocks<BackendType::VLLM>(
+                  num_blocks, start_layer, layers_this_batch, gpu_block_ids,
+                  gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+                  cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
+                  h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+                  cpu_startoff_inside_chunks, chunk_size, streams_[i],
+                  transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
+                  is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
+                  ce_config_);
+              break;
+            case BackendType::TRTLLM:
+              flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+                  num_blocks, start_layer, layers_this_batch, gpu_block_ids,
+                  gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+                  cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
+                  h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+                  cpu_startoff_inside_chunks, chunk_size, streams_[i],
+                  transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
+                  is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
+                  ce_config_);
+              break;
+            case BackendType::SGLANG:
+              flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+                  num_blocks, start_layer, layers_this_batch, gpu_block_ids,
+                  gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
+                  cpu_block_ids, cpu_ptr, h2d_cpu_kv_stride_in_bytes,
+                  h2d_cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+                  cpu_startoff_inside_chunks, chunk_size, streams_[i],
+                  transfer_cta_num, /*is_host_to_device=*/true, use_ce_transfer,
+                  is_mla, gpu_block_strides_in_bytes_[i], /*sync=*/false,
+                  ce_config_);
+              break;
+            }
 
-          if (swa_active) {
-            launch_swa_h2d_for_gpu_(i, start_layer, layers_this_batch,
-                                    swa_num_blocks, swa_gpu_block_ids,
-                                    swa_cpu_block_ids,
-                                    swa_h2d_cpu_kv_stride_in_bytes,
-                                    swa_h2d_cpu_layer_stride_in_bytes,
-                                    swa_cpu_block_stride_in_bytes,
-                                    transfer_cta_num, use_ce_transfer);
-          }
+            if (swa_active) {
+              launch_swa_h2d_for_gpu_(i, start_layer, layers_this_batch,
+                                      swa_num_blocks, swa_gpu_block_ids,
+                                      swa_cpu_block_ids,
+                                      swa_h2d_cpu_kv_stride_in_bytes,
+                                      swa_h2d_cpu_layer_stride_in_bytes,
+                                      swa_cpu_block_stride_in_bytes,
+                                      transfer_cta_num, use_ce_transfer);
+            }
 
-          // POLLING: record this GPU's batch event after its transfers on the
-          // same stream (worker is bound, no cudaSetDevice needed).
-          if (notify_mode_ == NotifyMode::POLLING) {
-            cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i],
-                            streams_[i]);
-          }
+            // POLLING: record this GPU's batch event after its transfers on the
+            // same stream (worker is bound, no cudaSetDevice needed).
+            if (notify_mode_ == NotifyMode::POLLING) {
+              cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i],
+                              streams_[i]);
+            }
 
-          cudaError_t err = cudaGetLastError();
-          if (err != cudaSuccess) {
-            failed = true;
-            error_msg = cudaGetErrorString(err);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+              append_gpu_error(gpu_errors, i, cudaGetErrorString(err));
+            }
+          } catch (const std::exception &error) {
+            append_gpu_error(gpu_errors, i, error.what());
+          } catch (...) {
+            append_gpu_error(gpu_errors, i, "unknown worker exception");
           }
-        } catch (const std::exception &e) {
-          failed = true;
-          error_msg = e.what();
-        }
-      }));
+        });
+        futures.emplace_back(i, std::move(future));
+      } catch (const std::exception &error) {
+        append_gpu_error(gpu_errors, i,
+                         "enqueue failed: " + std::string(error.what()));
+      } catch (...) {
+        append_gpu_error(gpu_errors, i, "enqueue failed: unknown exception");
+      }
     }
-    for (auto &f : futures) {
-      f.get();
-    }
-    if (failed) {
-      throw std::runtime_error("layerwise_transfer submit failed: " +
-                               error_msg);
-    }
+    drain_gpu_futures(futures, gpu_errors);
+    throw_if_gpu_errors("layerwise_transfer submit", gpu_device_ids_,
+                        gpu_errors);
 
     if (log_timing) {
       cudaSetDevice(gpu_device_ids_[0]);
@@ -1557,19 +1627,32 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     // Create per-GPU poll events on each pinned worker (bound device): avoids
     // O(origs * num_gpus) cudaSetDevice from the main thread.
     size_t num_poll = work_origs.size();
-    std::vector<std::future<void>> ev_futures;
+    std::vector<std::string> event_errors(num_gpus_);
+    std::vector<GpuFuture> ev_futures;
     ev_futures.reserve(num_gpus_);
     for (int d = 0; d < num_gpus_; ++d) {
-      ev_futures.emplace_back(enqueue_for_gpu(d, [this, d, num_poll]() {
-        for (size_t ai = 0; ai < num_poll; ++ai) {
-          cudaEventCreateWithFlags(&poll_batches_[ai].per_gpu_events[d],
-                                   cudaEventDisableTiming);
-        }
-      }));
+      try {
+        auto future = enqueue_for_gpu(d, [this, d, num_poll]() {
+          for (size_t ai = 0; ai < num_poll; ++ai) {
+            const cudaError_t status = cudaEventCreateWithFlags(
+                &poll_batches_[ai].per_gpu_events[d], cudaEventDisableTiming);
+            if (status != cudaSuccess) {
+              throw std::runtime_error("cudaEventCreateWithFlags failed: " +
+                                       std::string(cudaGetErrorString(status)));
+            }
+          }
+        });
+        ev_futures.emplace_back(d, std::move(future));
+      } catch (const std::exception &error) {
+        append_gpu_error(event_errors, d,
+                         "enqueue failed: " + std::string(error.what()));
+      } catch (...) {
+        append_gpu_error(event_errors, d, "enqueue failed: unknown exception");
+      }
     }
-    for (auto &f : ev_futures) {
-      f.get();
-    }
+    drain_gpu_futures(ev_futures, event_errors);
+    throw_if_gpu_errors("layerwise multi-group event creation", gpu_device_ids_,
+                        event_errors);
   }
 
   std::vector<nvtxRangeId_t> h2d_range_ids(num_original_layers_, 0);
@@ -1595,100 +1678,103 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     // members' main-KV transfer + SWA + POLLING event on streams_[d]. This
     // collapses cudaSetDevice from O(members * num_gpus) per orig to zero on
     // the submission path (workers are already bound).
-    std::atomic<bool> failed{false};
-    std::string error_msg;
-    std::vector<std::future<void>> futures;
+    std::vector<std::string> gpu_errors(num_gpus_);
+    std::vector<GpuFuture> futures;
     futures.reserve(num_gpus_);
     for (int d = 0; d < num_gpus_; ++d) {
-      futures.emplace_back(enqueue_for_gpu(d, [&, d]() {
-        try {
-          for (const auto &member : members) {
-            int gi = member.first;
-            int local_id = member.second;
-            const GroupParams &gp = groups_[gi];
-            int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
-            if (is_mla) {
-              cpu_startoff_inside_chunks =
-                  mode == "all_write" ? d * num_blocks * gp.cpu_block_stride
-                                      : 0;
+      try {
+        auto future = enqueue_for_gpu(d, [&, d]() {
+          try {
+            for (const auto &member : members) {
+              int gi = member.first;
+              int local_id = member.second;
+              const GroupParams &gp = groups_[gi];
+              int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
+              if (is_mla) {
+                cpu_startoff_inside_chunks =
+                    mode == "all_write" ? d * num_blocks * gp.cpu_block_stride
+                                        : 0;
+              }
+              int64_t gpu_startoff_inside_chunks = 0;
+              int64_t chunk_size = gp.gpu_chunk_sizes[d];
+              void *cpu_ptr_for_group =
+                  static_cast<char *>(cpu_blocks_) + gp.cpu_offset_bytes;
+
+              switch (gp.backend_type) {
+              case BackendType::VLLM:
+                flexkv::transfer_kv_blocks<BackendType::VLLM>(
+                    num_blocks, local_id, 1, gpu_block_ids,
+                    gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+                    cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+                    gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+                    cpu_startoff_inside_chunks, chunk_size, streams_[d],
+                    transfer_cta_num, true, use_ce_transfer, is_mla,
+                    gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+                break;
+              case BackendType::TRTLLM:
+                flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+                    num_blocks, local_id, 1, gpu_block_ids,
+                    gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+                    cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+                    gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+                    cpu_startoff_inside_chunks, chunk_size, streams_[d],
+                    transfer_cta_num, true, use_ce_transfer, is_mla,
+                    gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+                break;
+              case BackendType::SGLANG:
+                flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+                    num_blocks, local_id, 1, gpu_block_ids,
+                    gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
+                    cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
+                    gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
+                    cpu_startoff_inside_chunks, chunk_size, streams_[d],
+                    transfer_cta_num, true, use_ce_transfer, is_mla,
+                    gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
+                break;
+              }
             }
-            int64_t gpu_startoff_inside_chunks = 0;
-            int64_t chunk_size = gp.gpu_chunk_sizes[d];
-            void *cpu_ptr_for_group =
-                static_cast<char *>(cpu_blocks_) + gp.cpu_offset_bytes;
 
-            switch (gp.backend_type) {
-            case BackendType::VLLM:
-              flexkv::transfer_kv_blocks<BackendType::VLLM>(
-                  num_blocks, local_id, 1, gpu_block_ids,
-                  gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
-                  cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
-                  gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
-                  cpu_startoff_inside_chunks, chunk_size, streams_[d],
-                  transfer_cta_num, true, use_ce_transfer, is_mla,
-                  gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-              break;
-            case BackendType::TRTLLM:
-              flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-                  num_blocks, local_id, 1, gpu_block_ids,
-                  gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
-                  cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
-                  gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
-                  cpu_startoff_inside_chunks, chunk_size, streams_[d],
-                  transfer_cta_num, true, use_ce_transfer, is_mla,
-                  gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-              break;
-            case BackendType::SGLANG:
-              flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-                  num_blocks, local_id, 1, gpu_block_ids,
-                  gp.gpu_tensor_handlers[d], gpu_startoff_inside_chunks,
-                  cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
-                  gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
-                  cpu_startoff_inside_chunks, chunk_size, streams_[d],
-                  transfer_cta_num, true, use_ce_transfer, is_mla,
-                  gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
-              break;
+            if (swa_active) {
+              if (has_swa_multi_group_) {
+                launch_swa_mg_h2d_for_gpu_(d, orig, swa_num_blocks,
+                                           swa_gpu_block_ids, swa_cpu_block_ids,
+                                           transfer_cta_num, use_ce_transfer,
+                                           /*is_mla=*/true, mode);
+              } else {
+                launch_swa_h2d_for_gpu_(d, orig, 1, swa_num_blocks,
+                                        swa_gpu_block_ids, swa_cpu_block_ids,
+                                        swa_h2d_cpu_kv_stride_in_bytes,
+                                        swa_h2d_cpu_layer_stride_in_bytes,
+                                        swa_cpu_block_stride_in_bytes,
+                                        transfer_cta_num, use_ce_transfer);
+              }
             }
-          }
 
-          if (swa_active) {
-            if (has_swa_multi_group_) {
-              launch_swa_mg_h2d_for_gpu_(d, orig, swa_num_blocks,
-                                         swa_gpu_block_ids, swa_cpu_block_ids,
-                                         transfer_cta_num, use_ce_transfer,
-                                         /*is_mla=*/true, mode);
-            } else {
-              launch_swa_h2d_for_gpu_(d, orig, 1, swa_num_blocks,
-                                      swa_gpu_block_ids, swa_cpu_block_ids,
-                                      swa_h2d_cpu_kv_stride_in_bytes,
-                                      swa_h2d_cpu_layer_stride_in_bytes,
-                                      swa_cpu_block_stride_in_bytes,
-                                      transfer_cta_num, use_ce_transfer);
+            if (notify_mode_ == NotifyMode::POLLING) {
+              cudaEventRecord(poll_batches_[ai].per_gpu_events[d], streams_[d]);
             }
-          }
 
-          if (notify_mode_ == NotifyMode::POLLING) {
-            cudaEventRecord(poll_batches_[ai].per_gpu_events[d], streams_[d]);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+              append_gpu_error(gpu_errors, d, cudaGetErrorString(err));
+            }
+          } catch (const std::exception &error) {
+            append_gpu_error(gpu_errors, d, error.what());
+          } catch (...) {
+            append_gpu_error(gpu_errors, d, "unknown worker exception");
           }
-
-          cudaError_t err = cudaGetLastError();
-          if (err != cudaSuccess) {
-            failed = true;
-            error_msg = cudaGetErrorString(err);
-          }
-        } catch (const std::exception &e) {
-          failed = true;
-          error_msg = e.what();
-        }
-      }));
+        });
+        futures.emplace_back(d, std::move(future));
+      } catch (const std::exception &error) {
+        append_gpu_error(gpu_errors, d,
+                         "enqueue failed: " + std::string(error.what()));
+      } catch (...) {
+        append_gpu_error(gpu_errors, d, "enqueue failed: unknown exception");
+      }
     }
-    for (auto &f : futures) {
-      f.get();
-    }
-    if (failed) {
-      throw std::runtime_error(
-          "layerwise_transfer_multi_group submit failed: " + error_msg);
-    }
+    drain_gpu_futures(futures, gpu_errors);
+    throw_if_gpu_errors("layerwise_transfer_multi_group submit",
+                        gpu_device_ids_, gpu_errors);
 
     bool is_last_active = (ai + 1 == work_origs.size());
     int next_orig = is_last_active ? -1 : work_origs[ai + 1];
