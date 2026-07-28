@@ -1047,6 +1047,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
                 is_mla=self.is_mla,
                 ce_kernel_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold,
+                ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+                ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             )
 
             self.tp_group_transfer_groups.append({
@@ -1122,6 +1124,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     0,                 # start_layer_id (always 0 within group)
                     gp['num_layers'],  # all layers in this group
                     self.is_mla,
+                    mla_d2h_mode=self.mla_d2h_mode,
                 )
         else:
             self.tp_transfer_thread_group.tp_group_transfer(
