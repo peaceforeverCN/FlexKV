@@ -33,7 +33,6 @@ Or using JSON configuration:
 - `ssd_cache_dir`: Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/` to improve bandwidth.
 - `enable_gds`: Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default.
 - `swa_multi_group`: DeepSeek-V4 SWA sidecar policy (**breaking change**: was a bool, is now a tri-state int enum in `{0, 1, 2}`). `null` / omitted normalizes to `2`. Meaning: `0` = register nothing SWA-related (no SWA KV, no attention state, no indexer state; suitable for unified_kv_triton where the GPU owns SWA entirely, or for A/B tests that skip FlexKV SWA I/O); `1` = register SWA KV only, skip attention/indexer compress-state sidecars (equivalent to the old `false`); `2` = register SWA + attention state + indexer state (equivalent to the old `true`, and the default). Legacy `true` / `false` values are rejected at startup with a migration hint (`true` -> `2`, `false` -> `1`).
-- `swa_multi_layer`: Controls whether layerwise restore fuses SWA/state H2D into the main layerwise worker. It defaults to `true`; set it to `false` to use the standalone SWA/state H2D predecessor path.
 
 To disable FlexKV SWA I/O entirely (e.g. unified_kv_triton), add the following explicit setting:
 
@@ -56,7 +55,6 @@ If the `FLEXKV_CONFIG_PATH` environment variable is not set, configuration can b
 | `FLEXKV_SSD_CACHE_DIR` | str | "./flexkv_ssd" | Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"` to improve bandwidth |
 | `FLEXKV_ENABLE_GDS` | bool | 0 | Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default, set to 1 to enable |
 | `FLEXKV_SWA_MULTI_GROUP` | int | unset (normalizes to 2) | For DeepSeek-V4: `0` = no SWA / attention-state / indexer-state registration (unified_kv_triton or A/B), `1` = SWA KV only, `2` = SWA + attention-state + indexer-state (default). Legacy `true` / `false` values are rejected at startup |
-| `FLEXKV_SWA_MULTI_LAYER` | bool | 1 | `1` fuses SWA/state H2D into layerwise restore; `0` uses the standalone SWA/state H2D predecessor worker |
 
 ---
 

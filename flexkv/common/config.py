@@ -877,10 +877,6 @@ class UserConfig:
     #   None (unset) -> normalized to 2 (preserve legacy default).
     # See _normalize_swa_multi_group() for the actual normalization.
     swa_multi_group: Optional[int] = None
-    # Fuse SWA/state H2D into the main layerwise restore worker. Disable this to
-    # keep SWA/state on the standalone predecessor worker as a compatibility or
-    # debugging fallback.
-    swa_multi_layer: bool = True
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -912,11 +908,6 @@ class UserConfig:
                     "swa_multi_group must be one of {0, 1, 2}, "
                     f"got {self.swa_multi_group!r}"
                 )
-        if not isinstance(self.swa_multi_layer, bool):
-            raise ValueError(
-                "swa_multi_layer must be a boolean, "
-                f"got {self.swa_multi_layer!r}"
-            )
 
 
 def _normalize_swa_multi_group(value: Optional[int]) -> int:
@@ -999,7 +990,6 @@ def load_user_config_from_env() -> UserConfig:
         mooncake_store_config_path=os.getenv('FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None),
         kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
         swa_multi_group=_parse_swa_multi_group_env(swa_multi_group_env),
-        swa_multi_layer=bool(int(os.getenv('FLEXKV_SWA_MULTI_LAYER', 1))),
     )
 
 def convert_to_block_num(size_in_GB: float, block_size_in_bytes: int) -> int:
