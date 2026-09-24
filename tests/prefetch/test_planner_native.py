@@ -348,6 +348,9 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
         results,
         worker,
     )
+    # Health check state added by the bounded worker-startup fix.
+    ipc.error_parent_conn, _error_child_conn = ctx.Pipe(duplex=False)
+    ipc._worker_error = None
     handle = TransferManagerHandle.__new__(TransferManagerHandle)
     handle._handle = ipc
     queued = QueuedTransferHandle(handle)
