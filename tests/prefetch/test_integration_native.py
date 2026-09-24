@@ -364,7 +364,11 @@ def test_running_legacy_cancel_retains_callbacks_until_terminal(engine):
     callback.assert_not_called()
     engine._get_completed_ops = lambda timeout: [CompletedOp.completed_graph(107)]
     engine._runtime.call(KVTaskManager._update_tasks, engine, 0)
-    callback.assert_called_once()
+    # A cancelled transfer keeps ownership until its graph drains, then rolls
+    # its plan back instead of committing (matches e5fd291).
+    callback.assert_not_called()
+    callback.abort.assert_called_once()
+    assert task.status == TaskStatus.CANCELLED
     assert 7 not in engine.tasks and 107 not in engine.graph_to_task
 
 
