@@ -928,6 +928,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("slot"))
       .def("promote_swa", &flexkv::CRadixTreeIndex::promote_swa,
            py::arg("node"))
+      .def("split_node", &flexkv::CRadixTreeIndex::split_node,
+           py::arg("node"), py::arg("prefix_length"),
+           py::return_value_policy::reference)
       .def("evict_swa", &flexkv::CRadixTreeIndex::evict_swa,
            py::arg("evicted_full_blocks"), py::arg("num_swa_evicted"),
            py::call_guard<py::gil_scoped_release>())

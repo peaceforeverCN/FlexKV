@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 import threading
 import time
 from functools import partial, wraps
@@ -553,6 +554,18 @@ class CacheEngineAccel:
 
         return node
 
+    def split_node_at_match(self, match_result: MatchResultAccel) -> Optional[CRadixNode]:
+        """Make ``match_result`` end on a node boundary; return that node.
+
+        Used to mount an SWA snapshot at a page that is interior to an existing
+        node. Returns None when the match does not end strictly inside a node.
+        """
+        node = match_result.last_node
+        length = int(match_result.last_node_matched_length)
+        if node is None or length <= 0 or length >= int(node.size()):
+            return None
+        return self.index.split_node(node, length)
+
     def lock_node(self, node: CRadixNode) -> None:
         self.index.lock(node)
 
@@ -818,6 +831,14 @@ class CacheEngine:
                                                 medium=DEVICE_TYPE[self.device_type])
         return node
 
+    def split_node_at_match(self, match_result: MatchResult) -> Optional[RadixNode]:
+        """Python-index mirror of ``CacheEngineAccel.split_node_at_match``."""
+        node = match_result.last_node
+        length = int(match_result.last_node_matched_length)
+        if node is None or length <= 0 or length >= int(node.size()):
+            return None
+        return self.index.split_node(node, length)
+
     def lock_node(self, node: RadixNode) -> None:
         self.index.lock(node)
 
@@ -972,6 +993,12 @@ class GlobalCacheEngine:
             )
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
+        # Mount SWA snapshots at page boundaries interior to an existing node:
+        # a PUT whose Full KV is already cached but whose end carries no SWA
+        # still writes the snapshot (SWA-only PUT), and commit splits the node
+        # so the snapshot sits on a node's last page (I0).
+        self.swa_boundary_snapshot = bool(int(
+            os.getenv("FLEXKV_SWA_BOUNDARY_SNAPSHOT", "1")))
         if cache_config.enable_kv_sharing:
             assert redis_meta is not None
             self.redis_meta = redis_meta
@@ -2280,6 +2307,10 @@ class GlobalCacheEngine:
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
         if fragment12_num_blocks == 0 and not self.use_mooncake_store_backend:
+            if self._cpu_swa_snapshot_missing(cpu_matched_result, block_mask_end):
+                return self._put_swa_only(
+                    request_id, sequence_meta, block_mask_start, block_mask_end,
+                    cpu_matched_result, dp_client_id)
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
@@ -2298,6 +2329,10 @@ class GlobalCacheEngine:
         if (fragment12_num_blocks == 0
                 and fragment2_num_blocks == 0
                 and fragment3_num_blocks == 0):
+            if self._cpu_swa_snapshot_missing(cpu_matched_result, block_mask_end):
+                return self._put_swa_only(
+                    request_id, sequence_meta, block_mask_start, block_mask_end,
+                    cpu_matched_result, dp_client_id)
             return self._empty_put_return(request_id)
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
@@ -2635,6 +2670,10 @@ class GlobalCacheEngine:
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
         if fragment12_num_blocks == 0:
+            if self._cpu_swa_snapshot_missing(cpu_matched_result, block_mask_end):
+                return self._put_swa_only(
+                    request_id, sequence_meta, block_mask_start, block_mask_end,
+                    cpu_matched_result, dp_client_id)
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
@@ -2818,6 +2857,132 @@ class GlobalCacheEngine:
             deferred_release=deferred_release,
         )
 
+    def _cpu_swa_snapshot_missing(self, cpu_matched_result, end_block: int) -> bool:
+        """True when CPU caches Full KV up to ``end_block`` but no SWA ends there.
+
+        Such a PUT carries no new Full block, yet its trailing SWA window is the
+        only snapshot that makes the prefix ``[0, end_block)`` reusable (e.g. a
+        branch point repaired on the GPU tree). Requires an engine that can
+        split a node so commit can mount the snapshot mid-node.
+        """
+        if not getattr(self, "swa_boundary_snapshot", False):
+            return False
+        if not self.swa_op_constructor.enabled:
+            return False
+        engine = self.cpu_cache_engine
+        if engine is None or not getattr(engine, "swa_enabled", False):
+            return False
+        if not callable(getattr(engine, "split_node_at_match", None)):
+            return False
+        # Exact: commit mounts only where the rematch ends at ``end_block``.
+        if end_block <= 0 or int(cpu_matched_result.num_matched_blocks) != end_block:
+            return False
+        boundary = self._matched_boundary_node(cpu_matched_result, end_block)
+        return boundary is None or not boundary.has_swa()
+
+    def _put_swa_only(self,
+                      request_id: int,
+                      sequence_meta: SequenceMeta,
+                      block_mask_start: int,
+                      block_mask_end: int,
+                      cpu_matched_result,
+                      dp_client_id: int) -> PutTransferPlan:
+        """Write only the trailing SWA window of a Full-cached prefix to CPU.
+
+        GPU:  (all Full blocks already on CPU)        | SWA tail page
+                                                             ↓
+        CPU:  (cpu cached, possibly mid-node)         | SWA slot (mounted at commit)
+
+        The CPU tier commit rematches, splits the node at ``block_mask_end`` when
+        that boundary is interior, and mounts the slot there.
+        """
+        cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+            cpu_matched_result.last_node)
+        if cpu_swa_slot < 0:
+            return self._empty_put_return(request_id)
+        transfer_graph = TransferOpGraph()
+        empty = np.array([], dtype=np.int64)
+        try:
+            swa_ops = self.swa_op_constructor.build_put_chain(
+                transfer_graph,
+                gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
+                ssd_slot_ids=empty,
+                remote_slot_ids=empty,
+                dp_client_id=dp_client_id,
+                return_op_ids=True,
+            )
+        except Exception:
+            self.cpu_cache_engine._free_swa_slot(cpu_swa_slot)
+            raise
+        if swa_ops.d2h_id is None:
+            self.cpu_cache_engine._free_swa_slot(cpu_swa_slot)
+            return self._empty_put_return(request_id)
+
+        deferred_inserts: List[DeferredCacheInsert] = []
+        tier_commits: List[DeferredTierCommit] = []
+        deferred_release = DeferredRelease()
+        op_callback_dict: Dict[int, Callable] = {}
+        self._schedule_tier_commit(
+            DeferredCacheInsert(
+                device_type=DeviceType.CPU,
+                sequence_meta=sequence_meta,
+                physical_blocks=empty,
+                staged_start_block=block_mask_end,
+                remote_start_block=block_mask_end,
+                requested_end_block=block_mask_end,
+                swa_slot=cpu_swa_slot,
+                publish_to_peer=self.cache_config.enable_p2p_cpu,
+            ),
+            [swa_ops.d2h_id],
+            tier_commits, deferred_inserts, deferred_release,
+            op_callback_dict, self._commit_tier_on_write)
+
+        # Pin the node holding the boundary so its Full KV survives until the
+        # commit has split it and mounted the snapshot.
+        node_to_unlock = {}
+        if cpu_matched_result.last_node is not None:
+            node_to_unlock[DeviceType.CPU] = cpu_matched_result.last_node
+        flexkv_logger.debug(
+            "[FlexKV-SWA] SWA-only PUT planned: "
+            f"request_id={request_id}, end_block={block_mask_end}, "
+            f"cpu_swa_slot={cpu_swa_slot}")
+        return PutTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=[swa_ops.d2h_id],
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=0,
+            skipped_gpu_blocks=block_mask_end - block_mask_start,
+            deferred_inserts=deferred_inserts,
+            tier_commits=tier_commits,
+            deferred_release=deferred_release,
+        )
+
+    def _split_for_swa_boundary(self, engine, pending: DeferredCacheInsert,
+                                current_match):
+        """Split the node the commit's end falls inside; return the prefix node.
+
+        Only for an SWA-carrying commit whose rematch reaches exactly
+        ``requested_end_block`` but ends strictly inside a node. Returns None
+        (caller releases the slot, the previous behavior) when disabled or not
+        applicable.
+        """
+        if not getattr(self, "swa_boundary_snapshot", False):
+            return None
+        if pending.swa_slot < 0 or pending.publish_to_peer:
+            return None
+        if (pending.swa_anchor_block >= 0
+                and pending.swa_anchor_block + 1 != pending.requested_end_block):
+            return None
+        if int(current_match.num_matched_blocks) != pending.requested_end_block:
+            return None
+        split = getattr(engine, "split_node_at_match", None)
+        if not callable(split):
+            return None
+        return split(current_match)
+
     @staticmethod
     def _matched_boundary_node(current_match, matched_blocks: int):
         """Return the matched node only when ``matched_blocks`` ends on it."""
@@ -2977,6 +3142,12 @@ class GlobalCacheEngine:
                 engine.recycle(physical_blocks)
             boundary_node = self._matched_boundary_node(
                 current_match, pending.requested_end_block)
+            if (boundary_node is None and pending.swa_slot >= 0
+                    and publish_end == pending.requested_end_block):
+                # The end falls inside an existing node: split there so the
+                # snapshot can sit on the prefix node's last page (I0).
+                boundary_node = self._split_for_swa_boundary(
+                    engine, pending, current_match)
             if pending.swa_slot >= 0:
                 if boundary_node is None or publish_end != pending.requested_end_block:
                     self._release_pending_swa_slot(engine, pending, release)

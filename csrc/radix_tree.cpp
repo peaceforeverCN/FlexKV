@@ -312,6 +312,15 @@ void CRadixTreeIndex::validate_insert_target(
   }
 }
 
+CRadixNode *CRadixTreeIndex::split_node(CRadixNode *node, int prefix_length) {
+  if (node == nullptr || node->get_index() != this || is_root(node) ||
+      node->get_parent() == nullptr || prefix_length <= 0 ||
+      prefix_length >= node->size()) {
+    return nullptr;
+  }
+  return node->split(prefix_length);
+}
+
 CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
                                     torch::Tensor &block_hashes, int num_blocks,
                                     int num_insert_blocks,

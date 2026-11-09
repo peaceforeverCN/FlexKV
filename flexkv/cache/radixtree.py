@@ -313,6 +313,24 @@ class RadixTreeIndex:
         self._freed_swa_slots = []
         return out
 
+    def split_node(self, node: RadixNode, prefix_length: int) -> Optional[RadixNode]:
+        """Split ``node`` after ``prefix_length`` blocks; return the PREFIX node.
+
+        Mirror of ``CRadixTreeIndex::split_node``: lets an SWA snapshot be
+        mounted on a page boundary inside an existing node (I0). The suffix keeps
+        its SWA, lock and leaf state; the prefix is internal with no SWA.
+        """
+        if (node is None or node.is_root() or node.parent is None
+                or prefix_length <= 0 or prefix_length >= node.size()):
+            return None
+        was_leaf = node.is_leaf()
+        if was_leaf:
+            self.leaf_nodes.pop(node.head_hash(), None)
+        prefix = node.split(prefix_length)
+        if was_leaf:
+            self.leaf_nodes[node.head_hash()] = node
+        return prefix
+
     def set_swa(self, node: RadixNode, slot: int) -> None:
         """Mount an SWA slot on ``node``'s trailing page (store side).
 

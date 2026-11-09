@@ -525,6 +525,14 @@ public:
     swa_enabled_ = true;  // arm the I2 cascade in full-KV evict()
   }
 
+  // Split `node` after its first `prefix_length` blocks and return the new
+  // PREFIX node, so an SWA snapshot can be mounted on a page boundary that
+  // falls inside an existing node (I0: SWA lives on a node's LAST page). The
+  // suffix keeps its SWA slot, lock, and leaf state; the prefix is internal
+  // with lock_cnt 0, like the split done by insert (locks are node-level and
+  // pin near-leaf nodes only). Returns nullptr when the split is invalid.
+  CRadixNode *split_node(CRadixNode *node, int prefix_length);
+
   // Refresh a node's SWA recency on read-hit: splice it to the SWA-LRU MRU.
   // SWA recency lives in the LRU list position (evict_swa walks the list, never
   // reads swa_last_access_time), so a hit that only bumped the timestamp would
