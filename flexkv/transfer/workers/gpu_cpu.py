@@ -391,6 +391,63 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         """
         return [self._pools[pid] for pid in sorted(self._pools)]
 
+    @staticmethod
+    def _check_uniform_chunk_widths(
+        pool_id: PoolId,
+        gpu_kv_layouts: List[KVCacheLayout],
+        gpu_chunk_sizes: List[int],
+        cpu_kv_layout: KVCacheLayout,
+        cpu_chunk_size: int,
+        name: str,
+    ) -> None:
+        """Fail loudly when the host mirror is not as wide as the GPU buffer.
+
+        ``chunk_size_in_bytes`` handed to cpp comes from the GPU layout while
+        every CPU-side stride comes from the host layout (see the RegionSpec
+        built below, and region_batch.cpp). Nothing downstream compares them,
+        so a disagreement is silent:
+
+        * host wider than GPU - every slot keeps an uninitialised tail that
+          SSD / remote / mooncake still ship, the tiers over-allocate by the
+          ratio, and ``is_full_block`` in region_batch.cpp turns false, quietly
+          dropping the fast path;
+        * host narrower than GPU - cpp copies ``chunk_size`` bytes from a base
+          computed with the smaller stride, i.e. a host-side overrun.
+
+        Only SWA is checked. The main pool legitimately differs here: its CPU
+        layout carries the node-wide head count while each GPU layout carries
+        this rank's shard, so the two chunk sizes are not expected to match
+        under TP. SWA is single-head and single-region on both sides
+        (``num_head=1, kv_dim=1``), which makes the per-token width directly
+        comparable even when the page sizes differ (SM120 direct-SWA gives the
+        GPU pool 64-token pages against the host's 256).
+        """
+        if not pool_id.is_swa:
+            return
+        cpu_tokens = cpu_kv_layout.tokens_per_block
+        if cpu_tokens <= 0 or cpu_chunk_size % cpu_tokens:
+            return
+        cpu_width = cpu_chunk_size // cpu_tokens
+        for i, (gpu_layout, gpu_chunk) in enumerate(
+            zip(gpu_kv_layouts, gpu_chunk_sizes)
+        ):
+            gpu_tokens = gpu_layout.tokens_per_block
+            if gpu_tokens <= 0 or gpu_chunk % gpu_tokens:
+                continue
+            gpu_width = gpu_chunk // gpu_tokens
+            if gpu_width == cpu_width:
+                continue
+            raise ValueError(
+                f"{name} pool geometry mismatch on gpu[{i}]: the host mirror is "
+                f"{cpu_width} B/token/layer but the GPU buffer is {gpu_width} "
+                f"(host chunk={cpu_chunk_size} over {cpu_tokens} tokens, "
+                f"gpu chunk={gpu_chunk} over {gpu_tokens} tokens). The host "
+                f"SWA width must be measured from the GPU pool - see "
+                f"FlexKVConnector._sync_swa_bytes_per_token; a stale "
+                f"cache_config.swa.bytes_per_token_per_layer is the usual cause "
+                f"after a DSv4 KV layout change."
+            )
+
     def _init_uniform(
         self,
         gpu_blocks: List[List[torch.Tensor]],
@@ -440,6 +497,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
         cpu_block_stride = cpu_kv_layout.get_block_stride() * dtype_sz
         cpu_chunk_size = cpu_kv_layout.get_chunk_size() * dtype_sz
+        self._check_uniform_chunk_widths(
+            pool_id, gpu_kv_layouts, gpu_chunk_sizes, cpu_kv_layout,
+            cpu_chunk_size, name,
+        )
         # tp has effect on the layout of the cpu tensor: the tp dim is always
         # right after the block dim, on both BLOCKFIRST and LAYERFIRST.
         eff_cpu_layout = cpu_kv_layout

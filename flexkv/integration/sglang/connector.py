@@ -426,6 +426,14 @@ class FlexKVConnector:
                     for buffer in group["buffers"]
                 )
             self.cache_config.swa.snapshot_bytes = snapshot_bytes
+            # Replace the bootstrap estimate with the width the GPU pool really
+            # has. The estimate assumed the V4 paged layout (584 B/token padded
+            # to 585 by the 576-byte page alignment); sglang picks the layout
+            # from SGLANG_DSV4_KV_LAYOUT and the GPU arch, and V4.1 / V4.1-FP4
+            # are 528 / 288 B/token. Measuring keeps the host pool byte-exact
+            # with the GPU buffer for any of them, the same way the main KV
+            # groups already derive their head_size from the live tensors.
+            self._sync_swa_bytes_per_token()
 
         # Heterogeneous groups change the bytes represented by one logical
         # FlexKV block. Recompute CPU/SSD capacities before KVManager starts.
@@ -3551,6 +3559,73 @@ class FlexKVConnector:
             )
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
 
+    @staticmethod
+    def _measure_swa_bytes_per_token(swa_pool: Any) -> Optional[int]:
+        """Per-token-per-layer byte width of the SWA GPU buffer, measured.
+
+        The DSv4 pools store each page as ``[num_pages, page_bytes]`` uint8,
+        where ``page_bytes = kv_layout.page_bytes(page_size)`` already includes
+        the layout's page-alignment padding. Dividing by the pool's own page
+        size gives the per-token stride the host mirror must match, whatever
+        KVLayout sglang chose (V4 585, V4.1 528, V4.1-FP4 288 at page_size=256).
+
+        Returns None when the pool exposes no usable buffer, so callers can
+        keep the configured value rather than crash on an unexpected pool.
+        """
+        buffers = list(getattr(swa_pool, "kv_buffer", []) or [])
+        if not buffers:
+            return None
+        sample = buffers[0]
+        page_size = int(getattr(swa_pool, "page_size", 0) or 0)
+        if page_size <= 0 or sample.ndim != 2:
+            return None
+        if sample.shape[1] % page_size != 0:
+            raise RuntimeError(
+                f"FlexKV SWA buffer stride {sample.shape[1]} is not divisible "
+                f"by the pool page size {page_size}; cannot derive a per-token "
+                "byte width"
+            )
+        return int(sample.shape[1]) // page_size
+
+    def _sync_swa_bytes_per_token(self) -> None:
+        """Pin cache_config.swa.bytes_per_token_per_layer to the GPU buffer.
+
+        ``storage_engine`` builds the CPU/SSD/REMOTE SWA layouts with
+        ``head_size=bytes_per_token_per_layer``, and in the uniform (no state
+        sidecar) path that number alone decides the host slot stride. DSv4.1
+        has no SWA-page-mapped compress state, so it always takes that path and
+        a stale estimate would silently over-allocate every SWA tier and leave
+        an uninitialised tail inside each slot that SSD/remote/mooncake would
+        then ship whole.
+        """
+        swa_cfg = self.cache_config.swa
+        if swa_cfg is None or self._swa_kv_pool is None:
+            return
+        measured = self._measure_swa_bytes_per_token(self._swa_kv_pool)
+        if measured is None:
+            logger.warning(
+                "[FlexKV] SWA pool %s exposes no measurable kv_buffer; keeping "
+                "the configured bytes_per_token_per_layer=%d %s",
+                type(self._swa_kv_pool).__name__,
+                swa_cfg.bytes_per_token_per_layer,
+                self._label,
+            )
+            return
+        configured = int(swa_cfg.bytes_per_token_per_layer)
+        if measured != configured:
+            logger.warning(
+                "[FlexKV] SWA bytes_per_token_per_layer %d -> %d (measured from "
+                "the GPU pool: stride=%d / page_size=%d). The configured value "
+                "assumed a different DSv4 KV layout; using the measured width "
+                "so the host mirror stays byte-exact %s",
+                configured,
+                measured,
+                int(self._swa_kv_pool.kv_buffer[0].shape[1]),
+                int(self._swa_kv_pool.page_size),
+                self._label,
+            )
+        swa_cfg.bytes_per_token_per_layer = measured
+
     def _build_dsv4_swa_registration(self):
         """SWA GPU pool geometry for DSv4: (caches, layout, layer_groups,
         gpu_layouts, handles_per_group), all None when the model has no SWA
@@ -3570,7 +3645,10 @@ class FlexKVConnector:
                 raise RuntimeError(
                     "FlexKV DSv4 SWA buffers must be 2D with a page-aligned stride"
                 )
-            head_size = sample.shape[1] // sub_page_size
+            # Same measurement the host pool width is pinned to in
+            # _sync_swa_bytes_per_token; keep the two derived from one formula
+            # so a layout change cannot move only one of them.
+            head_size = self._measure_swa_bytes_per_token(swa_pool)
             swa_layout = KVCacheLayout(
                 type=KVCacheLayoutType.LAYERFIRST,
                 num_layer=len(swa_buffers),

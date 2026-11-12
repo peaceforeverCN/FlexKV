@@ -111,18 +111,22 @@ def _warn_nvfp4_unsupported_framework(dtype_str: Optional[str], framework: str) 
 
 def _dsv4_swa_padded_bytes_per_token(swa_page_size: int,
                                      logical_bytes_per_token: int = 584) -> int:
-    """Effective per-token byte width of the DSv4 SWA GPU buffer, INCLUDING the
+    """Bootstrap estimate of the DSv4 SWA per-token byte width, INCLUDING the
     576-byte page-alignment padding that DeepSeekV4SingleKVPool.create_buffer
-    applies.
+    applies to the V4 layout.
 
-    The GPU SWA buffer stores each page as
-    ``bytes_per_page_padded = ceil_div(swa_page_size * 584, 576) * 576`` and the
-    connector registers ``head_size = bytes_per_page_padded / swa_page_size``.
-    For swa_page_size=256 this is 149760/256 = 585 (584 logical + 1B/token of
-    spread padding). The FlexKV host SWA pool must use the SAME width so byte
-    offsets line up with the GPU buffer stride. Requires the padded page bytes
-    to divide evenly by swa_page_size (holds for typical DSv4 configs); raises
-    otherwise so a mismatch fails loudly rather than shearing SWA KV silently.
+    This runs before the GPU pool is reachable, so it can only assume the V4
+    layout (584 B/token -> 149760 B per 256-token page -> 585 B/token). sglang
+    picks the layout from SGLANG_DSV4_KV_LAYOUT and the GPU architecture, and
+    the V4.1 variants are narrower (528 B/token fp8, 288 B/token fp4), so this
+    number is NOT authoritative: ``FlexKVConnector._sync_swa_bytes_per_token``
+    overwrites it with the width measured off ``swa_kv_pool.kv_buffer`` as soon
+    as the pool exists, and ``GPUCPUTransferWorker._check_uniform_chunk_widths``
+    refuses the transfer if anything still disagrees. Keep it only as the
+    pre-registration placeholder that sizes the initial slot count. Requires
+    the padded page bytes to divide evenly by swa_page_size (holds for typical
+    DSv4 configs); raises otherwise so a mismatch fails loudly rather than
+    shearing SWA KV silently.
     """
     non_padded = swa_page_size * logical_bytes_per_token
     padded = ((non_padded + 576 - 1) // 576) * 576
