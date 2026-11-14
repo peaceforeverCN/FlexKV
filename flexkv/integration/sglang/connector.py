@@ -52,6 +52,7 @@ from flexkv.integration.sglang.comm import (
     FlexKVComm,
     FlexKVLayerDoneCounter,
     FlexKVScatterChannel,
+    recv_exactly,
     send_fds,
 )
 
@@ -2617,6 +2618,42 @@ class FlexKVConnector:
             return
         kvcache.register_layer_transfer_counter(self.layer_done_counter)
 
+    @property
+    def layerwise_pipelined(self) -> bool:
+        """Are layerwise slot lifetimes GPU-driven rather than batch-bound?
+
+        Decided by the worker during the eventfd handshake (it is the side
+        that creates the events), so this is only meaningful afterwards.
+        """
+        return (
+            self.layer_done_counter is not None
+            and self.layer_done_counter.pipelined
+        )
+
+    def seal_layerwise_batch(self) -> int:
+        """Close the batch under assembly and return the slot it loaded into.
+
+        The scheduler calls this once per batch, after admission: from here on
+        no further restore may join, and the returned slot travels with the
+        batch to the forward that must wait on it. -1 means nothing was
+        loaded.
+
+        Only pipelined slots need this. Without it the slot is implicit --
+        there can only be one live at a time -- which is exactly the property
+        that prevented batch N+1's transfer from starting during batch N.
+        """
+        if self.layer_done_counter is None:
+            return -1
+        if not self.layer_done_counter.pipelined:
+            return -1
+        return self.layer_done_counter.seal_producer()
+
+    def activate_layerwise_consumer(self, counter_id: int) -> None:
+        """Point the forward about to run at the slot its batch loaded into."""
+        if self.layer_done_counter is None:
+            return
+        self.layer_done_counter.activate_consumer(counter_id)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -3889,11 +3926,49 @@ class FlexKVConnector:
                     raise RuntimeError(
                         f"FlexKV layerwise worker NACK'd eventfd transfer (ack={ack!r})"
                     )
+
+                # Phase 3: the worker's IPC event handles, if it is running the
+                # pipelined path. A length of 0 means it is not, and the fds
+                # keep their original "layer landed" meaning -- so an old
+                # worker and a new consumer still agree.
+                #
+                # Only read when we asked for pipelining. A worker from before
+                # this protocol existed sends a bare ACK and nothing else, so
+                # reading the length unconditionally would hang the default
+                # path for 30s and then fail it -- a regression for everyone
+                # who has not opted in.
+                handle_blob = b""
+                if GLOBAL_CONFIG_FROM_ENV.layerwise_pipeline:
+                    try:
+                        raw_len = recv_exactly(sock, 4)
+                    except Exception as exc:  # noqa: BLE001
+                        raise RuntimeError(
+                            "FLEXKV_LAYERWISE_PIPELINE is set but the worker "
+                            "did not send the IPC handle length; it is "
+                            f"probably an older build: {exc}"
+                        ) from exc
+                    (blob_len,) = struct.unpack("i", raw_len)
+                    if blob_len < 0:
+                        raise RuntimeError(
+                            f"Invalid IPC handle blob length {blob_len}"
+                        )
+                    if blob_len:
+                        handle_blob = recv_exactly(sock, blob_len)
+                        self.layer_done_counter.attach_ipc_handles(handle_blob)
+                    else:
+                        raise RuntimeError(
+                            "FLEXKV_LAYERWISE_PIPELINE is set but the worker "
+                            "exported no IPC handles; the consumer would "
+                            "silently fall back to blocking waits"
+                        )
+
                 logger.info(
-                    "[FlexKV] Eventfd handshake complete %s counters=%d layers=%d",
+                    "[FlexKV] Eventfd handshake complete %s counters=%d "
+                    "layers=%d pipelined=%s",
                     self._label,
                     num_counters,
                     self.rank_info.num_layers_per_pp_stage,
+                    bool(handle_blob),
                 )
                 return
             except Exception as exc:  # noqa: BLE001

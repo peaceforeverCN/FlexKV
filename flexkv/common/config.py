@@ -921,6 +921,36 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     kv_shared_across_ranks_mode=os.getenv('FLEXKV_KV_SHARED_ACROSS_RANKS_MODE', 'sharded'),
 
     layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
+    # Cross-batch layerwise pipelining ("two-batch").
+    #
+    # Off (the default) is the historical behaviour: the eventfd a layer posts
+    # means "layer L has landed", so the consumer's per-layer wait is a
+    # blocking read on its kernel-launch thread, and the worker drains each op
+    # before taking the next. Those two facts force the H2D for a prefill
+    # batch to happen *inside* that batch's forward, with nothing overlapping.
+    #
+    # On, three things change together -- they are one switch because none of
+    # them is correct without the others:
+    #   1. The per-layer marker becomes an interprocess cudaEvent, and the
+    #      eventfd downgrades to announcing "layer L is enqueued". The consumer
+    #      then expresses the dependency with cudaStreamWaitEvent and never
+    #      blocks its CPU on data.
+    #   2. The worker stops draining inside the op: it records a drain marker
+    #      and reports completion once polling shows it fired, so op N+1 can be
+    #      enqueued while op N's DMA is still running.
+    #   3. The consumer's triple-buffered ring stops being pinned to batch
+    #      boundaries, because the slot's lifetime is now proven by a GPU event
+    #      instead of by "forward consumed the last layer".
+    #
+    # Implies layerwise_notify_mode='ipc_event'; setting both is redundant but
+    # harmless. Set FLEXKV_LAYERWISE_PIPELINE=0 to A/B against the blocking
+    # path, which stays byte-for-byte on its original code path.
+    layerwise_pipeline=os.getenv('FLEXKV_LAYERWISE_PIPELINE', '1') not in
+        ('0', 'false', 'False'),
+    # Upper bound on layerwise ops the worker will keep in flight. 2 is what
+    # two-batch needs; higher only helps if the scheduler can run further
+    # ahead than one batch, and each one pins its source blocks.
+    layerwise_max_inflight=int(os.getenv('FLEXKV_LAYERWISE_MAX_INFLIGHT', '2')),
     # When the consumer of a CPU->GPU transfer is told a layer is readable:
     # 'per_layer' (one eventfd per original layer, what sglang's overlapped
     # attention needs) or 'whole' (told once, when the op lands). See

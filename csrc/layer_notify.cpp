@@ -8,13 +8,20 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <unistd.h>
 
 namespace flexkv {
 
 LayerNotifyMode parse_layer_notify_mode(const std::string &s) {
-  return s == "polling" ? LayerNotifyMode::POLLING : LayerNotifyMode::HOSTFUNC;
+  if (s == "polling") {
+    return LayerNotifyMode::POLLING;
+  }
+  if (s == "ipc_event") {
+    return LayerNotifyMode::IPC_EVENT;
+  }
+  return LayerNotifyMode::HOSTFUNC;
 }
 
 LayerEventfdTable::LayerEventfdTable(const torch::Tensor &fds_tensor,
@@ -87,6 +94,141 @@ LayerNotifier::~LayerNotifier() {
   shutdown_polling();
   destroy_events();
   release_event_pool();
+  release_ipc_events();
+}
+
+void LayerNotifier::init_ipc_events(int num_counters, int num_layers,
+                                    const std::vector<int> &device_ids) {
+  const int ranks = static_cast<int>(device_ids.size());
+  if (num_counters <= 0 || num_layers <= 0 || ranks <= 0) {
+    throw std::invalid_argument(
+        "init_ipc_events needs positive counters, layers and ranks");
+  }
+  if (ipc_counters_ == num_counters && ipc_layers_ == num_layers &&
+      ipc_device_ids_ == device_ids) {
+    return; // idempotent: the handshake may be retried
+  }
+  // A reshape invalidates every handle the consumer may already hold, so it
+  // cannot be silently absorbed.
+  if (!ipc_events_.empty()) {
+    throw std::runtime_error(
+        "init_ipc_events called twice with different shapes; the consumer's "
+        "handles would already be stale");
+  }
+
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
+  std::vector<cudaEvent_t> grid(
+      static_cast<size_t>(num_counters) * ranks * num_layers, nullptr);
+  for (int c = 0; c < num_counters; ++c) {
+    for (int r = 0; r < ranks; ++r) {
+      cudaError_t err = cudaSetDevice(device_ids[r]);
+      if (err != cudaSuccess) {
+        cudaSetDevice(prev_device);
+        throw std::runtime_error(
+            std::string("init_ipc_events: cudaSetDevice(") +
+            std::to_string(device_ids[r]) + ") failed: " +
+            cudaGetErrorString(err));
+      }
+      for (int l = 0; l < num_layers; ++l) {
+        cudaEvent_t e = nullptr;
+        // Interprocess is what makes the handle exportable; DisableTiming is
+        // mandatory alongside it (the driver rejects the pair otherwise) and
+        // is what we want anyway -- nobody measures these.
+        err = cudaEventCreateWithFlags(
+            &e, cudaEventInterprocess | cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+          for (cudaEvent_t made : grid) {
+            if (made != nullptr) {
+              cudaEventDestroy(made);
+            }
+          }
+          cudaSetDevice(prev_device);
+          throw std::runtime_error(
+              std::string("init_ipc_events: cudaEventCreateWithFlags failed: ") +
+              cudaGetErrorString(err));
+        }
+        grid[(static_cast<size_t>(c) * ranks + r) * num_layers + l] = e;
+      }
+    }
+  }
+  cudaSetDevice(prev_device);
+
+  ipc_events_.swap(grid);
+  ipc_counters_ = num_counters;
+  ipc_ranks_ = ranks;
+  ipc_layers_ = num_layers;
+  ipc_device_ids_ = device_ids;
+}
+
+cudaEvent_t LayerNotifier::ipc_event_at(int counter, int rank,
+                                        int layer) const {
+  if (counter < 0 || counter >= ipc_counters_ || rank < 0 ||
+      rank >= ipc_ranks_ || layer < 0 || layer >= ipc_layers_) {
+    return nullptr;
+  }
+  return ipc_events_[(static_cast<size_t>(counter) * ipc_ranks_ + rank) *
+                         ipc_layers_ +
+                     layer];
+}
+
+std::string LayerNotifier::export_ipc_handles() const {
+  if (ipc_events_.empty()) {
+    return std::string();
+  }
+  const size_t stride = sizeof(cudaIpcEventHandle_t);
+  std::string out(ipc_events_.size() * stride, '\0');
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
+  for (int c = 0; c < ipc_counters_; ++c) {
+    for (int r = 0; r < ipc_ranks_; ++r) {
+      cudaSetDevice(ipc_device_ids_[r]);
+      for (int l = 0; l < ipc_layers_; ++l) {
+        const size_t idx =
+            (static_cast<size_t>(c) * ipc_ranks_ + r) * ipc_layers_ + l;
+        cudaIpcEventHandle_t handle{};
+        const cudaError_t err =
+            cudaIpcGetEventHandle(&handle, ipc_events_[idx]);
+        if (err != cudaSuccess) {
+          cudaSetDevice(prev_device);
+          throw std::runtime_error(
+              std::string("cudaIpcGetEventHandle failed: ") +
+              cudaGetErrorString(err));
+        }
+        std::memcpy(&out[idx * stride], &handle, stride);
+      }
+    }
+  }
+  cudaSetDevice(prev_device);
+  return out;
+}
+
+void LayerNotifier::release_ipc_events() {
+  if (ipc_events_.empty()) {
+    return;
+  }
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
+  for (int c = 0; c < ipc_counters_; ++c) {
+    for (int r = 0; r < ipc_ranks_; ++r) {
+      cudaSetDevice(ipc_device_ids_[r]);
+      for (int l = 0; l < ipc_layers_; ++l) {
+        cudaEvent_t e =
+            ipc_events_[(static_cast<size_t>(c) * ipc_ranks_ + r) *
+                            ipc_layers_ +
+                        l];
+        if (e != nullptr) {
+          cudaEventDestroy(e);
+        }
+      }
+    }
+  }
+  cudaSetDevice(prev_device);
+  ipc_events_.clear();
+  ipc_counters_ = 0;
+  ipc_ranks_ = 0;
+  ipc_layers_ = 0;
+  ipc_device_ids_.clear();
 }
 
 void LayerNotifier::reset(LayerNotifyMode mode,
@@ -184,6 +326,9 @@ void LayerNotifier::begin_layer(int layer) {
     for (size_t r = 0; r < device_ids_.size(); ++r) {
       b.per_rank_events[r] = event_for(layer, static_cast<int>(r));
     }
+  } else if (mode_ == LayerNotifyMode::IPC_EVENT) {
+    // Nothing per-batch to set up: the events are the pre-created grid, and
+    // the fd is posted by arm() once the launches are on the streams.
   } else if (table_.enabled()) {
     // One counter shared by this layer's ranks; the last callback frees it.
     b.hostfunc_counter = new std::atomic<int>(0);
@@ -203,6 +348,24 @@ void LayerNotifier::record(int layer, int rank, cudaStream_t stream) {
                            " without a matching begin_layer");
   }
   LayerBatch &b = batches_[batch_of_layer_[layer]];
+  if (mode_ == LayerNotifyMode::IPC_EVENT) {
+    cudaEvent_t e = ipc_event_at(counter_id_, rank, layer);
+    if (e == nullptr) {
+      throw std::logic_error(
+          "LayerNotifier::record in IPC_EVENT mode without an event for "
+          "counter " +
+          std::to_string(counter_id_) + " rank " + std::to_string(rank) +
+          " layer " + std::to_string(layer) + "; init_ipc_events was not "
+          "called or was called with a smaller shape");
+    }
+    const cudaError_t err = cudaEventRecord(e, stream);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaEventRecord failed for layer ") +
+                               std::to_string(layer) + ": " +
+                               cudaGetErrorString(err));
+    }
+    return;
+  }
   if (mode_ == LayerNotifyMode::POLLING) {
     cudaEventRecord(b.per_rank_events[rank], stream);
     return;
@@ -216,8 +379,24 @@ void LayerNotifier::record(int layer, int rank, cudaStream_t stream) {
 }
 
 void LayerNotifier::arm() {
-  if (!table_.enabled() || mode_ != LayerNotifyMode::POLLING ||
-      batches_.empty()) {
+  if (!table_.enabled() || batches_.empty()) {
+    return;
+  }
+  if (mode_ == LayerNotifyMode::IPC_EVENT) {
+    // Announce every declared layer as enqueued. This runs on the submitting
+    // thread after the launch fan-out has joined, so each layer named here
+    // already has its marker on every rank's stream -- which is precisely the
+    // guarantee the consumer needs before it may wait on the event.
+    //
+    // Posting in declaration order (ascending layer) is not required for
+    // correctness here, unlike POLLING: the consumer reads each layer's own
+    // fd, and the event behind it is already recorded.
+    for (const LayerBatch &b : batches_) {
+      table_.post(counter_id_, b.layer);
+    }
+    return;
+  }
+  if (mode_ != LayerNotifyMode::POLLING) {
     return;
   }
   {

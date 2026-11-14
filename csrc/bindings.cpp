@@ -787,6 +787,46 @@ PYBIND11_MODULE(c_ext, m) {
             return py::make_tuple(ok, err);
           },
           py::arg("timeout_s") = 600.0)
+      .def("submit_layerwise_async",
+           &flexkv::RegionBatchGroup::submit_layerwise_async,
+           py::arg("requests"), py::arg("empty_layers"), py::arg("counter_id"),
+           // Same reasoning as submit_layerwise(): the per-rank fan-out joins
+           // inside, so the GIL must not be held across it.
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "poll_layer_completion",
+          [](flexkv::RegionBatchGroup &self, int token) {
+            std::string err;
+            bool ok = false;
+            bool done = false;
+            {
+              // cudaEventQuery does not block, but it is still a driver call
+              // on a hot path polled from the worker loop.
+              py::gil_scoped_release unlock;
+              done = self.poll_layer_completion(token, &ok, &err);
+            }
+            return py::make_tuple(done, ok, err);
+          },
+          py::arg("token"))
+      .def("close_completion", &flexkv::RegionBatchGroup::close_completion,
+           py::arg("token"))
+      .def_property_readonly("inflight_completions",
+                             &flexkv::RegionBatchGroup::inflight_completions)
+      .def("init_ipc_events", &flexkv::RegionBatchGroup::init_ipc_events,
+           py::arg("num_counters"), py::arg("num_layers"),
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "export_ipc_handles",
+          [](const flexkv::RegionBatchGroup &self) {
+            std::string blob;
+            {
+              py::gil_scoped_release unlock;
+              blob = self.export_ipc_handles();
+            }
+            // py::bytes, not str: these are raw 64-byte driver handles and
+            // would not survive a utf-8 round trip.
+            return py::bytes(blob);
+          })
       .def("update_region_gpu_ptrs",
            &flexkv::RegionBatchGroup::update_region_gpu_ptrs,
            py::arg("region_index"), py::arg("gpu_block_ptrs_flat"),

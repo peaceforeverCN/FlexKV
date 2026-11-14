@@ -41,7 +41,11 @@ from flexkv.transfer.host_buffer import (
     safe_cuda_host_unregister,
 )
 from flexkv.transfer.template import gpu_strides_from_tensor
-from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
+from flexkv.transfer.worker_op import (
+    DEFERRED_COMPLETION,
+    WorkerTransferOp,
+    WorkerTransferResult,
+)
 from flexkv.transfer.workers.handle import WorkerHandle
 
 
@@ -95,6 +99,12 @@ def import_tensor_handles(
 # how long a worker sleeps between interruptibility checks. The previous value
 # (0.1 ms) made every idle worker burn a full core.
 _WORKER_IDLE_POLL_S = float(os.getenv("FLEXKV_WORKER_IDLE_POLL_S", "0.05"))
+
+# How long the loop sleeps while it has launched-but-undrained ops. Two orders
+# of magnitude below the idle interval: this latency lands directly on the
+# consumer, because an op is only reported from the loop that polls it.
+_DEFERRED_COMPLETION_POLL_S = float(
+    os.getenv("FLEXKV_DEFERRED_COMPLETION_POLL_S", "0.0005"))
 
 
 # Host regions whose CUDA drain did not complete at shutdown. Unregistering
@@ -167,6 +177,32 @@ class TransferWorkerBase(ABC):
             self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
             self._op_buffer_pinned = True
 
+    def has_deferred_completions(self) -> bool:
+        """Are there ops this worker launched but has not yet reported?
+
+        Default no: most backends finish an op inside ``launch_transfer``, so
+        returning from it *is* the completion. Overridden by the pipelined
+        layerwise path, where launching only means the copies are enqueued.
+        """
+        return False
+
+    def poll_deferred_completions(self) -> None:
+        """Report any deferred op whose completion marker has fired.
+
+        Must not block: it runs on the dispatch loop, and blocking here would
+        stall ops that are ready to launch.
+        """
+        return None
+
+    def drain_deferred_completions(self) -> None:
+        """Block until every deferred op has been reported.
+
+        Only for teardown. Unlike ``poll_deferred_completions`` this one must
+        wait: the ops hold pinned host memory that the caller is about to
+        unregister while a copy engine may still be reading it.
+        """
+        return None
+
     def shutdown(self) -> None:
         """Unregister all host tensors pinned by this worker. Idempotent.
 
@@ -176,6 +212,16 @@ class TransferWorkerBase(ABC):
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
+        # Deferred ops first, and blocking: their source blocks are pinned
+        # host memory that the loop below is about to unregister, and a copy
+        # engine may still be reading it.
+        try:
+            self.drain_deferred_completions()
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.error(
+                "worker %s: draining deferred completions at shutdown "
+                "failed: %s", getattr(self, "worker_id", "?"), e,
+                exc_info=True)
         # Backends release first: mooncake unregisters the very buffer the
         # loop below is about to cudaHostUnregister, and NIXL deregisters
         # memory it handed to the agent.
@@ -646,7 +692,17 @@ class TransferWorkerBase(ABC):
                 # readable, so a long timeout costs no dispatch latency, it
                 # only stops this loop from spinning a full core while idle.
                 # The timeout exists solely so the loop stays interruptible.
-                if not self.transfer_conn.poll(timeout=_WORKER_IDLE_POLL_S):
+                #
+                # Deferred completions shorten it: an op that was launched but
+                # not yet drained is reported from this loop, so sleeping the
+                # full idle interval would add that much latency to the
+                # consumer's view of the transfer. There may be no further op
+                # to wake us, which is why this cannot wait for traffic.
+                poll_timeout = _WORKER_IDLE_POLL_S
+                if self.has_deferred_completions():
+                    self.poll_deferred_completions()
+                    poll_timeout = _DEFERRED_COMPLETION_POLL_S
+                if not self.transfer_conn.poll(timeout=poll_timeout):
                     continue
 
                 op = self.transfer_conn.recv()
@@ -754,7 +810,14 @@ class TransferWorkerBase(ABC):
                     # resource its plan holds. A bare int still means success,
                     # so the queue format stays compatible.
                     try:
-                        if isinstance(transfer_status, WorkerTransferResult):
+                        if transfer_status is DEFERRED_COMPLETION:
+                            # Launched but not landed: the worker took over
+                            # reporting (see _reap_layerwise). Checked by
+                            # identity and before the truthiness branch below,
+                            # which would otherwise read a deferred op as a
+                            # failed one.
+                            pass
+                        elif isinstance(transfer_status, WorkerTransferResult):
                             # Partial-capable backends report completion even
                             # when zero blocks succeeded, so the graph can
                             # clean up and the caller can fall back rather
