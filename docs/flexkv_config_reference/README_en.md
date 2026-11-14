@@ -134,29 +134,46 @@ Some configurations can only be set through environment variables.
 
 ---
 
-### CPU KV Pool NUMA Spreading
+### CPU KV Pool NUMA Spreading and CPU Affinity
 
 > Note: This configuration can only be set through environment variables
 
-FlexKV's KVServer is launched by the `dp_client_id == 0` caller (e.g. the SGLang scheduler of GPU0), and the CPU KV pool shared by all GPUs is allocated in the TransferManager process it spawns. Linux mempolicy and CPU affinity are inherited across fork/exec, so when the inference engine binds each rank to its GPU's NUMA node (e.g. SGLang's default `SGLANG_AUTO_NUMA_BIND=1`, i.e. `numactl --cpunodebind=N --membind=N`), the whole CPU KV pool lands on GPU0's node, and Mooncake RDMA traffic only uses that node's NICs.
+FlexKV's KVServer is launched by the `dp_client_id == 0` caller (e.g. the SGLang scheduler of GPU0), and the CPU KV pool shared by all GPUs is allocated in the TransferManager process it spawns. Linux mempolicy and CPU affinity are inherited across fork/exec/spawn, which breaks two independent things:
 
-When enabled (off by default; set `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`), FlexKV follows Mooncake's `allocate_buffer_numa_segments`:
+- **Memory**: when the inference engine binds each rank to its GPU's NUMA node (e.g. SGLang's default `SGLANG_AUTO_NUMA_BIND=1`, i.e. `numactl --cpunodebind=N --membind=N`), the whole CPU KV pool lands on GPU0's node, and Mooncake RDMA traffic only uses that node's NICs.
+- **CPU**: when the engine pins a rank to a handful of cores (SGLang's `bind_dsv41_prefill_worker` gives each prefill rank 4 physical cores and binds every one of its threads), FlexKV's scheduler thread, transfer workers and Mooncake's RDMA threads end up time-sharing those same 4 cores **with the SGLang rank itself**, which costs far more throughput than a remote-node pool ever would.
 
-1. KVServer / TransferManager drop the inherited binding at startup: CPU affinity is reset to the CPUs of all participating nodes, and the task mempolicy becomes interleave across those nodes.
+The CPU half does not depend on the node count, so it is **fixed on single-NUMA hosts too** (older versions gated the whole reset on "at least two nodes", so single-socket hosts fell back to sharing the launcher's cores entirely). Single-NUMA and multi-NUMA hosts now take exactly the same CPU path; only the memory half differs.
+
+When enabled (the default), FlexKV follows Mooncake's `allocate_buffer_numa_segments`:
+
+1. KVServer / TransferManager drop the inherited binding at startup: CPU affinity is **widened to every CPU of the usable nodes**, so the kernel can schedule FlexKV on the cores no rank is using instead of queueing it behind the launcher on its own few cores. This step needs no NUMA syscall and no second node, so it runs on single-node hosts as well. With two or more nodes the task mempolicy also becomes interleave across them.
 2. The CPU KV pool (including the SWA pool) is split into one contiguous region per node, each set to its node with `mbind(MPOL_PREFERRED)`. Region boundaries are aligned to both the KV block and the page (and, for HugePages, to `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES`), so no block straddles two regions.
    - Default memory: the pool is a memfd (shmem). The per-region policy is set with `mbind` first, then TransferManager populates each region with parallel `fallocate` on that node's CPUs; the log prints `populated in Xs`. Without this, pages would be faulted lazily inside 16 workers' `cudaHostRegister` and Mooncake's `ibv_reg_mr` at the same time, which measured about 3x slower registration. This also removes the full copy the legacy path incurred when torch moved the private tensor into `/dev/shm`.
    - HugePages (`FLEXKV_USE_HUGEPAGE_CPU_BUFFER=1`): mbind on hugetlb memory only applies to the current VMA, so TransferManager prefaults every HugePage with node-local threads first (as Mooncake does). If a node lacks free HugePages, a warning is logged and the excess spills to other nodes.
 3. The Mooncake Store backend registers one MR per region; each region still honours `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` / `FLEXKV_MOONCAKE_MR_SPLIT_POLICY` internally. Mooncake labels each MR `cpu:N` from the node of its first page, so RDMA reads and writes of every region use that node's local NICs.
 
+Steps 2 and 3 need at least two usable nodes; step 1 does not.
+
+Widening the mask lets the scheduler keep FlexKV off the busy cores, but it does not *guarantee* it. Hard isolation is explicit, and comes from whoever knows the rank layout rather than from FlexKV guessing at it:
+
+- `FLEXKV_CPUS`: an explicit CPU list.
+- `FLEXKV_CPUS_PER_NODE=K`: reserve the **last** K physical cores of every usable node. SGLang's binders hand out the **head** cores of a node, so counting backwards from the tail is disjoint from every rank without knowing their number or placement.
+- **SGLang fills `FLEXKV_CPUS` in by itself** when it pins each rank to a few cores (`SGLANG_DSV41_SM120_CAKE_MEGAMOE=1`): `numa_utils.plan_dsv41_reserved_cpus()` computes the cores it handed to no rank and exports them. It runs in the launcher, before `numactl` narrows a rank to its own node, so the reservation covers **every** node; the cores taken on a node are `gpus_on_that_node * cores_per_rank`, which is static and exact -- no probing, no heuristic. Either variable being set already turns this off, so an explicit choice always wins.
+
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
-| `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 0 | Only `0` / `1` are accepted; other values fail at startup. `1`: enable the NUMA spreading above (reset inherited binding, split the CPU pool per node, register Mooncake MRs per region). `0`: legacy behaviour, memory follows the launcher's binding |
-| `FLEXKV_NUMA_NODES` | str | unset | Node list to spread over, e.g. `0,1` or `0-3`, intersected with the process's `Mems_allowed`. When unset, all nodes in `Mems_allowed` that have CPUs are used (memory-only CXL/HBM nodes are skipped). Nothing is done when fewer than 2 nodes remain |
+| `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 1 | Only `0` / `1` are accepted; other values fail at startup. `1`: enable the reset and NUMA spreading above. `0`: full legacy behaviour, both memory and CPUs follow the launcher's binding |
+| `FLEXKV_NUMA_NODES` | str | unset | Node list to use, e.g. `0,1` or `0-3`, intersected with the process's `Mems_allowed`. When unset, all nodes in `Mems_allowed` that have CPUs are used (memory-only CXL/HBM nodes are skipped). Only step 1 runs when fewer than 2 nodes remain |
+| `FLEXKV_CPUS` | str | unset | Pin FlexKV's processes to an explicit CPU list, e.g. `320-359,680-719`, used **verbatim** (not intersected with `FLEXKV_NUMA_NODES`: this one says where to run, that one says where to allocate). Takes precedence over `FLEXKV_CPUS_PER_NODE`. SGLang uses the same variable to hand over the cores it gave to no rank |
+| `FLEXKV_CPUS_PER_NODE` | int | 0 | `0` (default): every CPU of the usable nodes, with no attempt to infer where the ranks are -- the mask only has to *allow* the idle cores, and the scheduler picks among them better than a guess made once at startup. `K>0`: keep only the **last K physical cores** (with their SMT siblings) of every usable node. SGLang's binders hand out the **first** cores of a node (`set_gpu_proc_affinity` uses `gpu_id * cores_per_rank`, `bind_dsv41_prefill_worker` uses `sorted(cores)[ordinal * 4:]`), so counting backwards from the tail yields a fixed-size budget that is disjoint from every rank |
 
 Notes:
 
-- A warning is logged and the pool is not split in these cases: the container forbids `mbind` / `set_mempolicy` (Docker needs `--cap-add SYS_NICE`), or `lcm(block size, page/mapping alignment)` is too coarse for an even split. This fallback is **not** the same as `0`: the binding KVServer / TransferManager inherited has already been reset (CPU affinity widened to all participating nodes; interleave mempolicy when `set_mempolicy` succeeded), so the pool follows the reset policy rather than the launcher's binding. Set `0` for the exact legacy behaviour.
-- Log markers: `[NUMA][TransferManager] ... reset inherited binding`, `[NUMA] CPU pool ... spread over nodes`, and `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`. At runtime, `numastat -p <TransferManager pid>` or `numastat -m` shows per-node Shmem/HugePages usage.
+- Why the default does not subtract the rank cores by itself: FlexKV only ever sees the **one** mask it inherited, not the other ranks. Inferring them needs a heuristic ("how narrow is a mask") and its result depends on whether the other ranks happened to finish pinning themselves before the scan, which is not reproducible. The layout is static and known on the SGLang side, so SGLang passes it down through `FLEXKV_CPUS` (above) -- the information flows in the right direction.
+- The kernel silently intersects any `sched_setaffinity` mask with the cpuset. If the widened mask comes back *narrower* than the inherited one (possible inside a very narrow cpuset), a warning is logged and the inherited mask is kept -- resetting could only make things worse there. An explicitly small budget (`FLEXKV_CPUS` / `FLEXKV_CPUS_PER_NODE`) is honoured as-is: being narrow is its purpose.
+- A warning is logged and the pool is not split in these cases: the container forbids `mbind` / `set_mempolicy` (Docker needs `--cap-add SYS_NICE`), or `lcm(block size, page/mapping alignment)` is too coarse for an even split. This fallback is **not** the same as `0`: the binding KVServer / TransferManager inherited has already been reset, so the pool follows the reset policy rather than the launcher's binding. Set `0` for the exact legacy behaviour.
+- Log markers: `[NUMA][TransferManager] ... reset inherited binding: mempolicy=interleave[0, 1], cpus 8 -> 656 (FLEXKV_CPUS), disjoint from the launcher`, `[NUMA] CPU pool ... spread over nodes`, and `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`. On the SGLang side: `FLEXKV_CPUS=32-359,392-719: 656 cpus no prefill rank was given`. At runtime, `taskset -pc <TransferManager pid>` shows the affinity and `numastat -p <TransferManager pid>` or `numastat -m` the per-node Shmem/HugePages usage.
 - The CPU pool is shared by every GPU, so any GPU may read or write any block, and about half of the H2D/D2H traffic still crosses NUMA nodes. This feature balances memory capacity and RDMA NIC load across nodes.
 
 ---

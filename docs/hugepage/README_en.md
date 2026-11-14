@@ -56,7 +56,7 @@ If you plan to use 1 GiB HugePages, they usually need to be reserved through ker
 default_hugepagesz=1G hugepagesz=1G hugepages=N
 ```
 
-On multi-NUMA hosts, `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1` (off by default) splits the CPU KV pool evenly across nodes and prefaults its HugePages node by node at startup. Each node therefore needs enough reserved HugePages; check or set them per node via `/sys/devices/system/node/node*/hugepages/hugepages-*/nr_hugepages`. If a node runs short, a warning is logged and the excess spills to other nodes. See [Configuration Guide · CPU KV Pool NUMA Spreading](../flexkv_config_reference/README_en.md).
+On multi-NUMA hosts, `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1` (the default) splits the CPU KV pool evenly across nodes and prefaults its HugePages node by node at startup. Each node therefore needs enough reserved HugePages; check or set them per node via `/sys/devices/system/node/node*/hugepages/hugepages-*/nr_hugepages`. If a node runs short, a warning is logged and the excess spills to other nodes. See [Configuration Guide · CPU KV Pool NUMA Spreading and CPU Affinity](../flexkv_config_reference/README_en.md).
 
 ### 3.2 No hugetlbfs Mount Is Needed
 

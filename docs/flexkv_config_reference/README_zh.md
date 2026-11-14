@@ -132,29 +132,46 @@ swa_multi_group: false
 
 ---
 
-### CPU KV 池 NUMA 分布
+### CPU KV 池 NUMA 分布与 CPU 亲和性
 
 > 注：该配置只能通过环境变量设置
 
-FlexKV 的 KVServer 由 `dp_client_id == 0` 的调用方拉起（例如 SGLang 中 GPU0 的 scheduler），所有 GPU 共用的 CPU KV 池在它派生的 TransferManager 进程中分配。Linux 的内存策略（mempolicy）和 CPU 亲和性会随 fork/exec 继承；当推理引擎把每个 rank 绑到所在 GPU 的 NUMA 节点时（如 SGLang 默认的 `SGLANG_AUTO_NUMA_BIND=1`，即 `numactl --cpunodebind=N --membind=N`），整个 CPU KV 池都会落到 GPU0 所在节点，经 Mooncake 的 RDMA 传输也只走该节点的网卡。
+FlexKV 的 KVServer 由 `dp_client_id == 0` 的调用方拉起（例如 SGLang 中 GPU0 的 scheduler），所有 GPU 共用的 CPU KV 池在它派生的 TransferManager 进程中分配。Linux 的内存策略（mempolicy）和 CPU 亲和性会随 fork/exec/spawn 继承，因此会出现两个独立的问题：
 
-开启后（默认关闭，需设置 `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`）FlexKV 参照 Mooncake 的 `allocate_buffer_numa_segments`：
+- **内存**：当推理引擎把每个 rank 绑到所在 GPU 的 NUMA 节点时（如 SGLang 默认的 `SGLANG_AUTO_NUMA_BIND=1`，即 `numactl --cpunodebind=N --membind=N`），整个 CPU KV 池都会落到 GPU0 所在节点，经 Mooncake 的 RDMA 传输也只走该节点的网卡。
+- **CPU**：当推理引擎把 rank 绑到少量核心上时（如 SGLang 的 `bind_dsv41_prefill_worker` 给每个 prefill rank 分配 4 个物理核，并绑定它的每一个线程），FlexKV 的 scheduler 线程、transfer worker 和 Mooncake 的 RDMA 线程会和**该 SGLang rank 本身**挤在同样这 4 个核上互相抢占，性能损失远大于内存跨节点的代价。
 
-1. KVServer / TransferManager 启动时丢弃继承的绑定：CPU 亲和性重置为所有参与节点的 CPU，进程内存策略改为在这些节点间 interleave。
+CPU 侧的问题与节点数无关，因此**单 NUMA 机器上也会修复**（历史版本中整个重置逻辑被"至少两个节点"的条件挡住，单节点机器因此完全退化回挤占状态）。现在单 NUMA 与多 NUMA 走的是同一段 CPU 逻辑，只有内存侧有区别。
+
+开启后（默认开启）FlexKV 参照 Mooncake 的 `allocate_buffer_numa_segments`：
+
+1. KVServer / TransferManager 启动时丢弃继承的绑定：CPU 亲和性被**放宽为可用节点的全部 CPU**，这样内核就可以把 FlexKV 调度到没有 rank 在跑的核上，而不是和启动进程一起排在它那几个核上。这一步不需要任何 NUMA 系统调用，也不需要第二个节点，在单节点机器上同样生效。有两个及以上节点时，进程内存策略还会改为在这些节点间 interleave。
 2. CPU KV 池（含 SWA 池）按节点数切成连续的若干段，每段对应一个节点，并用 `mbind(MPOL_PREFERRED)` 设到该节点。段边界同时对齐 KV block 和页（HugePage 时还对齐 `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES`），不会有 block 跨段。
    - 默认内存：池子是一个 memfd（shmem）。先 `mbind` 设好段策略，再在 TransferManager 中每段用该节点的 CPU 并行 `fallocate` 预分配，日志中会打印 `populated in Xs`。如果不预分配，就要等 16 个 worker 的 `cudaHostRegister` 和 Mooncake 的 `ibv_reg_mr` 并发触发缺页，实测注册会慢约 3 倍。同时也省掉了旧路径里 torch 把私有 tensor 拷进 `/dev/shm` 的那一次全量拷贝。
    - HugePage（`FLEXKV_USE_HUGEPAGE_CPU_BUFFER=1`）：hugetlb 的 mbind 只对当前 VMA 生效，因此会在 TransferManager 中先用各节点本地的线程预分配全部大页（与 Mooncake 相同）。若某节点空闲大页不足会打印告警，超出部分溢出到其他节点。
 3. Mooncake Store 后端按段分别注册 MR（每段内部仍遵循 `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` / `FLEXKV_MOONCAKE_MR_SPLIT_POLICY`）。Mooncake 依据每个 MR 首页所在节点把它标记为 `cpu:N`，因此每一段的 RDMA 读写都会选用该节点的本地网卡。
 
+第 2、3 步需要至少两个可用节点；第 1 步不需要。
+
+放宽掩码只是**允许**内核把 FlexKV 放到空闲核上，并不**保证**它不落在 rank 的核上。真正的硬隔离是显式的，并且来自"知道 rank 排布的那一方"，而不是靠 FlexKV 去猜：
+
+- `FLEXKV_CPUS`：直接指定 CPU 列表。
+- `FLEXKV_CPUS_PER_NODE=K`：每个可用节点从**尾部**倒着预留 K 个物理核。SGLang 的绑核都从节点**头部**分配，所以倒着数一定与所有 rank 不相交，无需知道 rank 的数量和位置。
+- **SGLang 会自动填好 `FLEXKV_CPUS`**：当它把每个 rank 绑到少量核上时（`SGLANG_DSV41_SM120_CAKE_MEGAMOE=1`），`numa_utils.plan_dsv41_reserved_cpus()` 会把"没有分配给任何 rank 的核"算出来并写入 `FLEXKV_CPUS`。它在 launcher 进程里计算（此时 `numactl` 还没把进程收窄到单个节点），因此覆盖**所有**节点；每个节点占用的核数 = 该节点上的 GPU 数 × 每 rank 核数，全部静态可知，不做任何探测和启发式。只要 `FLEXKV_CPUS` 或 `FLEXKV_CPUS_PER_NODE` 已被显式设置，这一步就不会覆盖它。
+
 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 0 | 只接受 `0` / `1`，其他值启动时报错。`1`：开启上述 NUMA 分布（重置继承的绑定、CPU 池按节点分段、Mooncake MR 按段注册）。`0`：保持旧行为，内存跟随启动进程的绑定 |
-| `FLEXKV_NUMA_NODES` | str | 未设置 | 参与分布的节点列表，例如 `0,1` 或 `0-3`，会与进程的 `Mems_allowed` 取交集。未设置时使用 `Mems_allowed` 中所有带 CPU 的节点（不含仅有内存的 CXL/HBM 节点）。可用节点少于 2 个时不做任何处理 |
+| `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 1 | 只接受 `0` / `1`，其他值启动时报错。`1`：开启上述重置与 NUMA 分布。`0`：完全保持旧行为，内存和 CPU 都跟随启动进程的绑定 |
+| `FLEXKV_NUMA_NODES` | str | 未设置 | 参与的节点列表，例如 `0,1` 或 `0-3`，会与进程的 `Mems_allowed` 取交集。未设置时使用 `Mems_allowed` 中所有带 CPU 的节点（不含仅有内存的 CXL/HBM 节点）。可用节点少于 2 个时只做第 1 步 |
+| `FLEXKV_CPUS` | str | 未设置 | 显式指定 FlexKV 进程可用的 CPU 列表，例如 `320-359,680-719`，**原样使用**（不与 `FLEXKV_NUMA_NODES` 取交集：前者管"在哪跑"，后者管"在哪分配内存"）。优先于 `FLEXKV_CPUS_PER_NODE`。SGLang 也通过这个变量把它没分给任何 rank 的核交给 FlexKV |
+| `FLEXKV_CPUS_PER_NODE` | int | 0 | `0`（默认）：使用可用节点的全部 CPU，不去推测 rank 在哪 —— 掩码只要"允许"空闲核即可，内核做调度比启动时猜一次准得多。`K>0`：每个可用节点只保留**最后 K 个物理核**（含其 SMT 兄弟核）。SGLang 的绑核都从节点的**头部**分配（`set_gpu_proc_affinity` 用 `gpu_id * cores_per_rank`，`bind_dsv41_prefill_worker` 用 `sorted(cores)[ordinal * 4:]`），所以从尾部倒着数一定空闲，可得到大小固定、与所有 rank 不相交的 CPU 预算 |
 
 说明：
 
-- 以下情况会打印告警并退回为不分段：容器禁止 `mbind` / `set_mempolicy`（Docker 需 `--cap-add SYS_NICE`），或 `lcm(block 大小, 页/映射对齐)` 太大、无法均匀切分。注意退回后**不等同于** `0`：KVServer / TransferManager 继承的绑定此时已被重置（CPU 亲和性扩展到所有参与节点；`set_mempolicy` 成功时内存策略为 interleave），CPU 池按重置后的策略分配，而不是跟随启动进程的绑定。需要完全的旧行为请设为 `0`。
-- 日志关键字：`[NUMA][TransferManager] ... reset inherited binding`、`[NUMA] CPU pool ... spread over nodes`，以及 `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`。运行时可用 `numastat -p <TransferManager pid>` 或 `numastat -m` 确认各节点的 Shmem/HugePages 占用。
+- 为什么默认不自动排除 rank 的核：FlexKV 只能看到它继承的那**一个**掩码，看不到其它 rank；反推需要靠"掩码有多窄"之类的启发式，结果还依赖"扫描时其它 rank 是否已经绑完核"的时序，不可复现。rank 排布在 SGLang 侧是静态已知的，所以由 SGLang 通过 `FLEXKV_CPUS` 下发（见上），信息流方向是对的。
+- `sched_setaffinity` 的掩码会被内核静默地与 cpuset 求交。若放宽后的掩码反而比继承的掩码更小（cpuset 很窄时可能发生），会打印告警并保留继承的掩码——那种情况下重置只会更糟。显式指定的小预算（`FLEXKV_CPUS` / `FLEXKV_CPUS_PER_NODE`）不受此影响：窄本来就是它的目的。
+- 以下情况会打印告警并退回为不分段：容器禁止 `mbind` / `set_mempolicy`（Docker 需 `--cap-add SYS_NICE`），或 `lcm(block 大小, 页/映射对齐)` 太大、无法均匀切分。注意退回后**不等同于** `0`：KVServer / TransferManager 继承的绑定此时已被重置，CPU 池按重置后的策略分配，而不是跟随启动进程的绑定。需要完全的旧行为请设为 `0`。
+- 日志关键字：`[NUMA][TransferManager] ... reset inherited binding: mempolicy=interleave[0, 1], cpus 8 -> 656 (FLEXKV_CPUS), disjoint from the launcher`、`[NUMA] CPU pool ... spread over nodes`，以及 `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`。SGLang 侧对应 `FLEXKV_CPUS=32-359,392-719: 656 cpus no prefill rank was given`。运行时可用 `taskset -pc <TransferManager pid>` 确认亲和性、`numastat -p <TransferManager pid>` 或 `numastat -m` 确认各节点的 Shmem/HugePages 占用。
 - 由于 CPU 池被所有 GPU 共享，同一个 block 可能被任意 GPU 读写，H2D/D2H 仍会有约一半流量跨 NUMA；本功能保证的是内存容量和 RDMA 网卡负载在节点间均衡。
 
 ---

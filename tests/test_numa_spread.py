@@ -30,8 +30,18 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv(numa.ENV_ENABLE_NUMA_SPREAD, raising=False)
     monkeypatch.delenv(numa.ENV_NUMA_NODES, raising=False)
     numa.get_spread_nodes.cache_clear()
+    numa.get_usable_nodes.cache_clear()
     yield
     numa.get_spread_nodes.cache_clear()
+    numa.get_usable_nodes.cache_clear()
+
+
+@pytest.fixture
+def spreading_off(monkeypatch):
+    """Explicitly the legacy path; the flag itself defaults to on."""
+    monkeypatch.setenv(numa.ENV_ENABLE_NUMA_SPREAD, "0")
+    numa.get_spread_nodes.cache_clear()
+    numa.get_usable_nodes.cache_clear()
 
 
 @pytest.fixture
@@ -57,8 +67,8 @@ def blockfirst_layout(num_block=64):
 # ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True), (" 1 ", True)])
-def test_enable_flag_defaults_off(monkeypatch, value, expected):
+@pytest.mark.parametrize("value,expected", [(None, True), ("0", False), ("1", True), (" 1 ", True)])
+def test_enable_flag_defaults_on(monkeypatch, value, expected):
     if value is not None:
         monkeypatch.setenv(numa.ENV_ENABLE_NUMA_SPREAD, value)
     assert numa.numa_spread_enabled() is expected
@@ -90,9 +100,10 @@ def test_parse_list_rejects_garbage():
 # ---------------------------------------------------------------------------
 # Node selection
 # ---------------------------------------------------------------------------
-def test_spread_nodes_empty_when_disabled(monkeypatch):
+def test_spread_nodes_empty_when_disabled(monkeypatch, spreading_off):
     fake_host(monkeypatch, [0, 1], {0: {0}, 1: {1}})
     assert numa.get_spread_nodes() == ()
+    assert numa.get_usable_nodes() == ()
 
 
 def test_spread_nodes_skip_memory_only_nodes(monkeypatch):
@@ -105,6 +116,8 @@ def test_spread_nodes_need_two_nodes(monkeypatch):
     monkeypatch.setenv(numa.ENV_ENABLE_NUMA_SPREAD, "1")
     fake_host(monkeypatch, [0], {0: {0}})
     assert numa.get_spread_nodes() == ()
+    # ... but the single node is still usable for CPU affinity.
+    assert numa.get_usable_nodes() == (0,)
 
 
 def test_spread_nodes_env_is_intersected_with_mems_allowed(monkeypatch):
@@ -171,7 +184,7 @@ def test_plan_regions_aligned_contiguous_balanced(nodes, block, page):
     assert max(head_lengths) - min(head_lengths) <= unit
 
 
-def test_plan_regions_disabled_or_single_node():
+def test_plan_regions_disabled_or_single_node(spreading_off):
     assert numa.plan_cpu_pool_numa_regions(1 << 30, 4096, 4096) == []  # flag off
     assert numa.plan_cpu_pool_numa_regions(1 << 30, 4096, 4096, (0,)) == []
     assert numa.plan_cpu_pool_numa_regions(0, 4096, 4096, (0, 1)) == []
@@ -233,15 +246,15 @@ def test_touch_pages_keeps_content():
 
 
 # ---------------------------------------------------------------------------
-# Default (flag off) is the legacy path
+# Flag off is the legacy path
 # ---------------------------------------------------------------------------
-def test_default_reset_binding_is_noop(no_syscalls):
+def test_disabled_reset_binding_is_noop(no_syscalls, spreading_off):
     before = os.sched_getaffinity(0)
     numa.reset_inherited_numa_binding("test")
     assert os.sched_getaffinity(0) == before
 
 
-def test_default_cpu_allocator_is_legacy(no_syscalls, monkeypatch):
+def test_disabled_cpu_allocator_is_legacy(no_syscalls, spreading_off, monkeypatch):
     for name in ("populate_shmem_fd", "prefault_cpu_pool", "bind_cpu_pool"):
         monkeypatch.setattr(numa, name, lambda *a, **k: pytest.fail("NUMA path taken"))
     layout = blockfirst_layout()
@@ -251,7 +264,7 @@ def test_default_cpu_allocator_is_legacy(no_syscalls, monkeypatch):
     assert not handle.data.is_shared()  # legacy torch.empty, not the memfd pool
 
 
-def test_default_mooncake_registration_is_legacy(no_syscalls, monkeypatch):
+def test_disabled_mooncake_registration_is_legacy(no_syscalls, spreading_off, monkeypatch):
     from flexkv.transfer import backends
 
     monkeypatch.setattr(backends, "touch_pages", lambda *_: pytest.fail("touched pages"))
