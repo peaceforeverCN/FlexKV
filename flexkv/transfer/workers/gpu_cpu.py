@@ -40,11 +40,7 @@ from flexkv.transfer.region_batch import (
     region_batch_available,
 )
 from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
-from flexkv.transfer.worker_op import (
-    DEFERRED_COMPLETION,
-    WorkerLayerwiseTransferOp,
-    WorkerTransferOp,
-)
+from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
 # Stand-in for the block ids of a cached layerwise request, which are rebound
@@ -708,17 +704,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         structurally_empty = sum(1 for m in self._layer_milestones if not m)
         self._layerwise_completion_timeout_s = float(
             GLOBAL_CONFIG_FROM_ENV.layerwise_completion_timeout_s)
-        # Cross-batch pipelining state; see FLEXKV_LAYERWISE_PIPELINE.
-        self._layerwise_pipeline = bool(
-            GLOBAL_CONFIG_FROM_ENV.layerwise_pipeline)
-        self._layerwise_max_inflight = max(
-            1, int(GLOBAL_CONFIG_FROM_ENV.layerwise_max_inflight))
-        # (token, op_id, deadline, keepalive) per launched-but-undrained op.
-        # ``keepalive`` is the whole reason this list holds tuples rather than
-        # tokens: it pins the op's pinned block-id tensors, which the DMA is
-        # still reading. Dropping them here would hand the allocator back
-        # memory a copy engine is mid-flight on.
-        self._layerwise_inflight: List[Tuple[int, int, float, Any]] = []
 
         if not self._completion.needs_eventfd:
             return
@@ -731,31 +716,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             raise RuntimeError(
                 "[worker %s] completion=per_layer without an eventfd socket "
                 "path; nothing could ever signal a layer" % self.worker_id)
-
-        notify_mode = GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode
-        if self._layerwise_pipeline:
-            # One switch, three coupled changes -- the notify mode is not
-            # independently selectable here, because a pipelined worker whose
-            # fds still meant "landed" would deadlock: the consumer would be
-            # blocked reading a layer whose op has not been drained, and the
-            # op cannot drain while the consumer holds the launch thread.
-            notify_mode = "ipc_event"
-
-        armed_ipc = False
-
-        def _arm_ipc_events(num_counters: int, num_layers: int) -> bytes:
-            nonlocal armed_ipc
-            if not self._layerwise_pipeline:
-                return b""
-            self.region_batch.init_ipc_events(num_counters, num_layers)
-            blob = self.region_batch.export_ipc_handles()
-            armed_ipc = bool(blob)
-            return blob
-
         fds = receive_layer_eventfds(
             layerwise_eventfd_socket, tp_group_size, self._num_original_layers,
             log_prefix=f"[worker {self.worker_id}]",
-            on_shape_known=_arm_ipc_events,
         )
         if fds.numel() == 0:
             raise RuntimeError(
@@ -763,30 +726,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 "over no eventfds; nothing could ever signal a layer. Use "
                 "FLEXKV_LAYERWISE_COMPLETION_CONTRACT=whole if the consumer "
                 "does not want per-layer notification." % self.worker_id)
-        if self._layerwise_pipeline and not armed_ipc:
-            # The handshake completed without arming the event grid, so the
-            # consumer has no handles and IPC_EVENT would fail on the first
-            # record(). Fall back rather than refuse: the blocking path is
-            # correct, merely slower, and this is reachable whenever the
-            # handshake is bypassed (notably by tests that hand the fds over
-            # directly). Loud, because silently losing the pipeline is the
-            # kind of thing that only shows up as a benchmark regression.
-            flexkv_logger.warning(
-                "[worker %s] layerwise pipelining requested but the eventfd "
-                "handshake armed no IPC events; falling back to the blocking "
-                "path for this worker", self.worker_id)
-            self._layerwise_pipeline = False
-            notify_mode = GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode
         self.region_batch.set_layer_eventfds(
-            fds, tp_group_size, self._num_original_layers, notify_mode,
+            fds, tp_group_size, self._num_original_layers,
+            GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode,
         )
         flexkv_logger.info(
             f"[worker {self.worker_id}] per-layer completion armed: "
             f"layers={self._num_original_layers} "
             f"empty={structurally_empty} "
-            f"notify={notify_mode} "
-            f"pipeline={'on' if self._layerwise_pipeline else 'off'} "
-            f"max_inflight={self._layerwise_max_inflight}")
+            f"notify={GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode}")
 
     def _build_layer_milestones(self) -> List[List[Tuple[PoolId, int, int]]]:
         """Per original layer, the ``(pool_id, global_region_index, local_layer)``.
@@ -1390,7 +1338,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         counter_id: int,
         layer_id: int = 0,
         layer_granularity: int = -1,
-    ) -> Optional[int]:
+    ) -> None:
         """One H2D transfer, launched and notified one original layer at a time.
 
         Same regions and the same fan-out as a whole-block H2D; the only
@@ -1402,10 +1350,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         pools, in ascending layer order -- so a layer whose state spans main KV
         and SWA posts once, after both have landed, which is what the consumer
         means by "layer L is readable".
-
-        Returns ``None`` once the transfer has landed (the blocking path), or a
-        completion token the caller must poll before recycling the source
-        blocks (the pipelined path).
         """
         if self.region_batch is None:
             raise RuntimeError(
@@ -1447,121 +1391,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             layer for layer in plan.empty_layers if start <= layer < end
         ]
         if not requests and not empty_layers:
-            return None
+            return
 
-        if not self._layerwise_pipeline:
-            self.region_batch.submit_layerwise(
-                requests, empty_layers, counter_id)
-            # Launched, not landed. Returning here would let the engine recycle
-            # the source blocks while DMA is still reading them -- and we cannot
-            # drain inline before the posts, because the consumer is blocked on
-            # the very eventfds this transfer still has to write.
-            ok, err = self.region_batch.wait_layer_completion(
-                self._layerwise_completion_timeout_s)
-            if not ok:
-                raise RuntimeError(
-                    f"[worker {self.worker_id}] layerwise transfer did not "
-                    f"complete: {err}")
-            return None
-
-        # Pipelined: the same launches, but the drain becomes a marker we poll
-        # later. The source blocks still must not be recycled before it fires,
-        # which is why the caller keeps the tensors alive via the returned
-        # token's keepalive entry rather than relying on this frame.
-        return self.region_batch.submit_layerwise_async(
+        self.region_batch.submit_layerwise(
             requests, empty_layers, counter_id)
-
-    def has_deferred_completions(self) -> bool:
-        return bool(self._layerwise_inflight)
-
-    def poll_deferred_completions(self) -> None:
-        if self._layerwise_inflight:
-            self._reap_layerwise(block=False)
-
-    def drain_deferred_completions(self) -> None:
-        if not self._layerwise_inflight:
-            return
-        if self.region_batch is None:
-            # Nothing can be polled; the tokens are already void. Drop the
-            # keepalives so teardown can proceed, but say so loudly: this
-            # means ops were launched against a batch that has since gone.
-            flexkv_logger.error(
-                "[worker %s] %d deferred layerwise ops at shutdown but no "
-                "region batch to drain them against",
-                self.worker_id, len(self._layerwise_inflight))
-            self._layerwise_inflight.clear()
-            return
-        deadline = time.monotonic() + self._layerwise_completion_timeout_s
-        while self._layerwise_inflight and time.monotonic() < deadline:
-            self._reap_layerwise(block=False)
-            if self._layerwise_inflight:
-                time.sleep(0.0005)
-        if self._layerwise_inflight:
-            flexkv_logger.error(
-                "[worker %s] %d deferred layerwise ops still undrained after "
-                "%.1fs; releasing their source blocks anyway",
-                self.worker_id, len(self._layerwise_inflight),
-                self._layerwise_completion_timeout_s)
-            for token, op_id, _, _ in self._layerwise_inflight:
-                self.region_batch.close_completion(token)
-                self._report_layerwise_result(op_id, False)
-            self._layerwise_inflight.clear()
-
-    def _reap_layerwise(self, *, block: bool) -> None:
-        """Report completion for launched layerwise ops whose drain has fired.
-
-        ``block=False`` is the fast path off the worker's main loop: poll, free
-        what is done, leave the rest. ``block=True`` is for the admission gate
-        and shutdown, where we must not return while a slot is still needed.
-
-        A failed or timed-out op is reported as a failure rather than retried:
-        its graph has to learn about it, and the pinned source blocks cannot be
-        released until the DMA is provably not reading them.
-        """
-        if not self._layerwise_inflight:
-            return
-        while self._layerwise_inflight:
-            still: List[Tuple[int, int, float, Any]] = []
-            progressed = False
-            for token, op_id, deadline, keepalive in self._layerwise_inflight:
-                done, ok, err = self.region_batch.poll_layer_completion(token)
-                if not done:
-                    if time.monotonic() > deadline:
-                        self.region_batch.close_completion(token)
-                        progressed = True
-                        flexkv_logger.error(
-                            "[worker %s] layerwise op %d did not drain within "
-                            "%.1fs; reporting failure",
-                            self.worker_id, op_id,
-                            self._layerwise_completion_timeout_s)
-                        self._report_layerwise_result(op_id, False)
-                        continue
-                    still.append((token, op_id, deadline, keepalive))
-                    continue
-                progressed = True
-                if not ok:
-                    flexkv_logger.error(
-                        "[worker %s] layerwise op %d failed to drain: %s",
-                        self.worker_id, op_id, err)
-                self._report_layerwise_result(op_id, bool(ok))
-            self._layerwise_inflight = still
-            if not block:
-                return
-            if len(still) < self._layerwise_max_inflight:
-                return
-            if not progressed:
-                # Every slot is busy and nothing moved: yield rather than spin
-                # a core. Short enough not to matter against a transfer.
-                time.sleep(0.0002)
-
-    def _report_layerwise_result(self, op_id: int, ok: bool) -> None:
-        try:
-            self.finished_ops_queue.put(
-                (op_id, True, None) if ok else (op_id, False, None))
-        except Exception as e:  # noqa: BLE001
-            flexkv_logger.error(
-                "[worker %s] failed to report layerwise op %d: %s",
-                self.worker_id, op_id, e, exc_info=True)
+        # Launched, not landed. Returning here would let the engine recycle the
+        # source blocks while DMA is still reading them -- and we cannot drain
+        # inline before the posts, because the consumer is blocked on the very
+        # eventfds this transfer still has to write.
+        ok, err = self.region_batch.wait_layer_completion(
+            self._layerwise_completion_timeout_s)
+        if not ok:
+            raise RuntimeError(
+                f"[worker {self.worker_id}] layerwise transfer did not "
+                f"complete: {err}")
 
     def _launch_layerwise(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
         src = torch.from_numpy(
@@ -1578,14 +1421,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         else:
             swa_src = swa_dst = None
 
-        if self._layerwise_pipeline:
-            # Make room before launching, not after: the bound is on ops whose
-            # source blocks are pinned, and this one's are pinned from the
-            # submit onwards.
-            self._reap_layerwise(block=True)
-
         start_time = time.time()
-        token = self._layerwise_transfer_impl(
+        self._layerwise_transfer_impl(
             src, dst, swa_src, swa_dst, transfer_op.counter_id,
             layer_id=int(getattr(transfer_op, "layer_id", 0) or 0),
             layer_granularity=int(
@@ -1599,19 +1436,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             transfer_size += swa_pool.bytes_per_block * len(swa_src)
         self._log_transfer_performance(
             transfer_op, transfer_size, start_time, end_time)
-
-        if token is None:
-            return True
-        # Deferred: the op is not complete, so do not let the caller report it.
-        # _reap_layerwise owns the reporting from here, and the keepalive keeps
-        # the block-id tensors (which the DMA reads) alive until it does.
-        self._layerwise_inflight.append((
-            token,
-            transfer_op.transfer_op_id,
-            time.monotonic() + self._layerwise_completion_timeout_s,
-            (src, dst, swa_src, swa_dst),
-        ))
-        return DEFERRED_COMPLETION
+        return True
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):

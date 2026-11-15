@@ -18,19 +18,12 @@ int32, with ``-1`` for a rank/counter/layer the consumer did not supply.  That
 is exactly what ``LayerEventfdTable`` on the C++ side consumes.  An empty
 tensor means "nobody asked for notification", which every layer of the stack
 treats as ``CompletionContract.WHOLE``.
-
-Under ``FLEXKV_LAYERWISE_PIPELINE`` the same handshake also runs *backwards*:
-after the consumer's fds have landed, we reply with the IPC handles of the
-interprocess cudaEvents it should wait on, sliced to that rank.  The fds stay
--- their meaning narrows from "layer L landed" to "layer L is enqueued" (see
-``csrc/layer_notify.h``) -- so the protocol is additive and an old consumer
-talking to a new worker still works.
 """
 import os
 import socket
 import struct
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -42,11 +35,6 @@ from flexkv.common.debug import flexkv_logger
 # counter 1's transfer is already in flight. The consumer tells us the real
 # number in its handshake header; this is only the pre-handshake default.
 _DEFAULT_NUM_COUNTERS = 3
-
-# cudaIpcEventHandle_t. Fixed by the driver ABI, not by us; asserted against
-# the blob length the extension produces so a toolkit change cannot silently
-# shift every handle.
-IPC_EVENT_HANDLE_SIZE = 64
 
 
 def build_layerwise_eventfd_socket_path(
@@ -94,33 +82,6 @@ def _recv_fds(sock: socket.socket, num_fds: int) -> Tuple[List[int], bytes]:
     return fds, data
 
 
-def _slice_ipc_blob(
-    blob: bytes,
-    tp_rank: int,
-    num_counters: int,
-    tp_size: int,
-    num_layers: int,
-) -> bytes:
-    """One rank's ``[num_counters][num_layers]`` handles out of the full grid.
-
-    The grid is ``[counter][rank][layer]``, matching the eventfd table, so a
-    rank's handles are ``num_counters`` separate runs rather than one slice.
-    Sending only the rank's own run matters: a rank cannot open an event
-    belonging to another device anyway, and the full grid is tp_size times
-    larger for no purpose.
-    """
-    if not blob:
-        return b""
-    if not 0 <= tp_rank < tp_size:
-        return b""
-    run = num_layers * IPC_EVENT_HANDLE_SIZE
-    out = bytearray()
-    for counter in range(num_counters):
-        start = ((counter * tp_size) + tp_rank) * run
-        out += blob[start:start + run]
-    return bytes(out)
-
-
 def receive_layer_eventfds(
     socket_path: str,
     tp_group_size: int,
@@ -129,20 +90,12 @@ def receive_layer_eventfds(
     log_prefix: str = "[layer-eventfd]",
     max_retries: int = 180,
     retry_interval: float = 1.0,
-    on_shape_known: Optional[Callable[[int, int], bytes]] = None,
 ) -> torch.Tensor:
     """Serve the UDS until every rank has handed over its fds.
 
     Returns ``[num_counters, tp_size, num_layers]`` flat int32, or an empty
     tensor if nobody connected before the deadline -- the caller decides
     whether that is fatal (PER_LAYER) or fine (WHOLE).
-
-    ``on_shape_known(num_counters, num_layers)`` is called once, as soon as the
-    first rank reveals the table shape, and must return the full
-    ``[num_counters][tp_size][num_layers]`` IPC-handle blob (or ``b""`` for
-    none). Each rank is then sent its own slice. It is a callback rather than a
-    precomputed argument because the shape is the consumer's to declare, and
-    the events cannot be created before it is known.
     """
 
     def cleanup_socket() -> None:
@@ -181,9 +134,6 @@ def receive_layer_eventfds(
     all_rank_eventfds: Dict[int, Dict[int, List[int]]] = {}
     num_counters = _DEFAULT_NUM_COUNTERS
     conn_idx = 0
-    # Built once, on the first connection, then sliced per rank.
-    ipc_blob: bytes = b""
-    ipc_shape_done = False
 
     try:
         while len(all_rank_eventfds) < tp_group_size:
@@ -232,24 +182,6 @@ def receive_layer_eventfds(
                         num_layers = recv_num_layers
                         num_counters = recv_num_counters
 
-                    if not ipc_shape_done and on_shape_known is not None:
-                        # Once per server, under the shape the consumer just
-                        # declared. Done here rather than before the accept
-                        # loop because that shape is not ours to pick.
-                        ipc_blob = on_shape_known(num_counters, num_layers)
-                        ipc_shape_done = True
-                        expected = (
-                            num_counters * tp_group_size * num_layers
-                            * IPC_EVENT_HANDLE_SIZE
-                        )
-                        if ipc_blob and len(ipc_blob) != expected:
-                            raise RuntimeError(
-                                f"IPC handle blob is {len(ipc_blob)} bytes, "
-                                f"expected {expected} for "
-                                f"[{num_counters},{tp_group_size},"
-                                f"{num_layers}]"
-                            )
-
                     flexkv_logger.debug(
                         f"{log_prefix} connection {conn_idx}: "
                         f"effective_tp_rank={rank_key}, "
@@ -268,17 +200,7 @@ def receive_layer_eventfds(
 
                     all_rank_eventfds[rank_key] = rank_eventfds
                     try:
-                        # ACK, then this rank's handle slice. The old protocol
-                        # was a bare b"\x01" and a consumer that does not know
-                        # about handles simply never reads past it, so the
-                        # length prefix keeps both directions compatible.
-                        payload = _slice_ipc_blob(
-                            ipc_blob, rank_key, num_counters,
-                            tp_group_size, num_layers,
-                        )
-                        conn.sendall(b"\x01" + struct.pack("i", len(payload)))
-                        if payload:
-                            conn.sendall(payload)
+                        conn.sendall(b"\x01")  # ACK: fds landed
                     except Exception:  # noqa: BLE001
                         pass
                     flexkv_logger.info(

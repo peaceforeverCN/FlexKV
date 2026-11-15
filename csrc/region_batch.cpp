@@ -166,30 +166,6 @@ RegionBatchGroup::RegionBatchGroup(const std::vector<int64_t> &gpu_device_ids,
 }
 
 RegionBatchGroup::~RegionBatchGroup() {
-  // Destroy the completion markers before the pool: they were created against
-  // its devices, and destroying an event a stream still references is only
-  // safe once that stream's thread is gone -- which pool_.reset() below is
-  // what guarantees. Order matters the other way for the pointer tables, so
-  // this cannot simply move down.
-  {
-    std::lock_guard<std::mutex> lk(completion_mtx_);
-    if (!completions_.empty() && pool_ != nullptr) {
-      int prev_device = 0;
-      cudaGetDevice(&prev_device);
-      for (CompletionRecord &rec : completions_) {
-        for (size_t r = 0; r < rec.events.size(); ++r) {
-          if (rec.events[r] != nullptr) {
-            cudaSetDevice(pool_->device_id(static_cast<int>(r)));
-            cudaEventDestroy(rec.events[r]);
-          }
-        }
-        rec.events.clear();
-        rec.token = 0;
-      }
-      cudaSetDevice(prev_device);
-    }
-    completions_.clear();
-  }
   // Destroy the pool first: joining its threads guarantees nobody is still
   // reading the pointer tables freed below.
   pool_.reset();
@@ -409,15 +385,7 @@ void RegionBatchGroup::set_layer_eventfds(const torch::Tensor &fds_tensor,
   layer_notify_mode_ = parse_layer_notify_mode(notify_mode);
 }
 
-void RegionBatchGroup::init_ipc_events(int num_counters, int num_layers) {
-  notifier_.init_ipc_events(num_counters, num_layers, device_ids_);
-}
-
-std::string RegionBatchGroup::export_ipc_handles() const {
-  return notifier_.export_ipc_handles();
-}
-
-void RegionBatchGroup::launch_layerwise(
+void RegionBatchGroup::submit_layerwise(
     const std::vector<RegionRequest> &requests_in,
     const std::vector<int> &empty_layers, int counter_id) {
   notifier_.reset(layer_notify_mode_, device_ids_, counter_id);
@@ -490,160 +458,6 @@ void RegionBatchGroup::launch_layerwise(
       "submit_region_batch_layerwise");
 
   notifier_.arm();
-}
-
-void RegionBatchGroup::submit_layerwise(
-    const std::vector<RegionRequest> &requests_in,
-    const std::vector<int> &empty_layers, int counter_id) {
-  launch_layerwise(requests_in, empty_layers, counter_id);
-}
-
-int RegionBatchGroup::submit_layerwise_async(
-    const std::vector<RegionRequest> &requests_in,
-    const std::vector<int> &empty_layers, int counter_id) {
-  launch_layerwise(requests_in, empty_layers, counter_id);
-
-  const int ranks = pool_->size();
-  std::lock_guard<std::mutex> lk(completion_mtx_);
-
-  CompletionRecord *slot = nullptr;
-  for (CompletionRecord &rec : completions_) {
-    if (rec.token == 0) {
-      slot = &rec;
-      break;
-    }
-  }
-  if (slot == nullptr) {
-    completions_.emplace_back();
-    slot = &completions_.back();
-  }
-  if (slot->events.empty()) {
-    // One drain marker per rank, created on that rank's device and reused for
-    // the life of this slot. Not interprocess: nobody outside waits on these.
-    slot->events.assign(ranks, nullptr);
-    int prev_device = 0;
-    cudaGetDevice(&prev_device);
-    for (int r = 0; r < ranks; ++r) {
-      cudaSetDevice(pool_->device_id(r));
-      const cudaError_t err = cudaEventCreateWithFlags(&slot->events[r],
-                                                       cudaEventDisableTiming);
-      if (err != cudaSuccess) {
-        for (int j = 0; j < r; ++j) {
-          cudaEventDestroy(slot->events[j]);
-        }
-        slot->events.clear();
-        cudaSetDevice(prev_device);
-        throw std::runtime_error(
-            std::string("submit_layerwise_async: cudaEventCreateWithFlags "
-                        "failed: ") +
-            cudaGetErrorString(err));
-      }
-    }
-    cudaSetDevice(prev_device);
-  }
-
-  // Recorded from the caller's thread rather than each rank's: cudaEventRecord
-  // only needs the stream, and the ranks' threads have already joined inside
-  // launch_layerwise(), so there is nothing left to serialise against.
-  for (int r = 0; r < ranks; ++r) {
-    const cudaError_t err = cudaEventRecord(slot->events[r], pool_->stream(r));
-    if (err != cudaSuccess) {
-      throw std::runtime_error(
-          std::string("submit_layerwise_async: cudaEventRecord failed on rank ") +
-          std::to_string(r) + ": " + cudaGetErrorString(err));
-    }
-  }
-
-  slot->token = next_completion_token_++;
-  if (next_completion_token_ <= 0) {
-    next_completion_token_ = 1; // 0 is the free marker
-  }
-  return slot->token;
-}
-
-bool RegionBatchGroup::poll_layer_completion(int token, bool *ok,
-                                             std::string *error_out) {
-  if (ok != nullptr) {
-    *ok = false;
-  }
-  std::lock_guard<std::mutex> lk(completion_mtx_);
-  CompletionRecord *slot = nullptr;
-  for (CompletionRecord &rec : completions_) {
-    if (rec.token == token && token != 0) {
-      slot = &rec;
-      break;
-    }
-  }
-  if (slot == nullptr) {
-    // An unknown token is a bug in the caller's bookkeeping, not a transfer
-    // that finished: reporting "done and fine" would release source buffers
-    // that may still be in flight.
-    if (error_out != nullptr) {
-      *error_out = "unknown completion token " + std::to_string(token);
-    }
-    return true;
-  }
-
-  int prev_device = 0;
-  cudaGetDevice(&prev_device);
-  bool all_done = true;
-  bool failed = false;
-  std::string err_msg;
-  for (size_t r = 0; r < slot->events.size(); ++r) {
-    cudaSetDevice(pool_->device_id(static_cast<int>(r)));
-    const cudaError_t err = cudaEventQuery(slot->events[r]);
-    if (err == cudaErrorNotReady) {
-      all_done = false;
-      break;
-    }
-    if (err != cudaSuccess) {
-      failed = true;
-      all_done = true;
-      if (err_msg.empty()) {
-        err_msg = std::string("cudaEventQuery failed on GPU ") +
-                  std::to_string(pool_->device_id(static_cast<int>(r))) + ": " +
-                  cudaGetErrorString(err);
-      }
-      break;
-    }
-  }
-  cudaSetDevice(prev_device);
-
-  if (!all_done) {
-    return false;
-  }
-  slot->token = 0; // retire; the events stay for the next user
-  if (failed) {
-    if (error_out != nullptr) {
-      *error_out = err_msg;
-    }
-    return true;
-  }
-  if (ok != nullptr) {
-    *ok = true;
-  }
-  return true;
-}
-
-void RegionBatchGroup::close_completion(int token) {
-  std::lock_guard<std::mutex> lk(completion_mtx_);
-  for (CompletionRecord &rec : completions_) {
-    if (rec.token == token && token != 0) {
-      rec.token = 0;
-      return;
-    }
-  }
-}
-
-int RegionBatchGroup::inflight_completions() const {
-  std::lock_guard<std::mutex> lk(completion_mtx_);
-  int n = 0;
-  for (const CompletionRecord &rec : completions_) {
-    if (rec.token != 0) {
-      ++n;
-    }
-  }
-  return n;
 }
 
 bool RegionBatchGroup::wait_layer_completion(double timeout_s,

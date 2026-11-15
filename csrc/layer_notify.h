@@ -23,29 +23,6 @@
  *     A cudaEvent per (layer, rank) plus one thread doing cudaEventQuery.
  *     Costs a thread; wins when the callback thread is contended.
  *
- * ``IPC_EVENT``
- *     The consumer waits on the GPU, not the CPU.  We pre-create an
- *     interprocess cudaEvent per (counter, rank, layer) at handshake time and
- *     hand the consumer their IPC handles; ``record()`` then marks the layer
- *     on the transfer stream and the consumer issues
- *     ``cudaStreamWaitEvent`` on its own stream instead of blocking in
- *     ``read()``.
- *
- *     The eventfd is still posted, but its meaning changes: it no longer says
- *     "layer L has landed", it says "layer L's copies and its marker are
- *     *enqueued*".  That distinction is what makes the scheme correct.  A
- *     bare ``cudaStreamWaitEvent`` on an event that has not been recorded yet
- *     is a no-op -- or worse, waits on the *previous* transfer's recording --
- *     so the consumer must know the current generation is on the stream
- *     before it can wait for it.  The fd carries exactly that, and because it
- *     is posted by ``arm()`` on the submitting thread (after the launch
- *     fan-out has joined) rather than by the GPU, the consumer's read returns
- *     without blocking as soon as the submit is through.
- *
- *     So: the fd orders *generations* (CPU side, one read per layer that
- *     returns immediately), and the event orders *data* (GPU side, no CPU
- *     involvement).  Neither alone is sufficient.
- *
  * The eventfd write is ``uint64_t 1`` per tp_rank per layer -- a semaphore
  * post, one token per layer per transfer.  sglang consumes exactly one, so
  * writing 2 (or writing once for a two-layer batch) silently corrupts its
@@ -64,7 +41,7 @@
 
 namespace flexkv {
 
-enum class LayerNotifyMode { HOSTFUNC, POLLING, IPC_EVENT };
+enum class LayerNotifyMode { HOSTFUNC, POLLING };
 
 // Parse the Python-side string; anything unrecognised is HOSTFUNC, which is
 // the historical default.
@@ -119,27 +96,6 @@ public:
   const LayerEventfdTable &table() const { return table_; }
   bool enabled() const { return table_.enabled(); }
 
-  // Pre-create the [num_counters][ranks][num_layers] grid of interprocess
-  // events that IPC_EVENT mode records into, and keep it for this object's
-  // whole life.
-  //
-  // This is deliberately eager and deliberately not grown on demand, unlike
-  // the POLLING pool below: the consumer opens these handles exactly once, at
-  // handshake time, and an event created later could never be handed over.
-  // A second call with the same shape is a no-op, so the handshake can be
-  // retried.
-  void init_ipc_events(int num_counters, int num_layers,
-                       const std::vector<int> &device_ids);
-
-  // The grid's IPC handles, flattened to [num_counters][ranks][num_layers] of
-  // ``sizeof(cudaIpcEventHandle_t)`` bytes each -- the same axis order as the
-  // eventfd table, so the consumer indexes both the same way. Empty when
-  // init_ipc_events() has not run.
-  std::string export_ipc_handles() const;
-
-  int ipc_num_counters() const { return ipc_counters_; }
-  int ipc_num_layers() const { return ipc_layers_; }
-
   // Drain and release the previous transfer's state, then start a new one.
   // Safe to call when nothing is in flight.
   void reset(LayerNotifyMode mode, const std::vector<int> &device_ids,
@@ -159,10 +115,6 @@ public:
 
   // Start the polling thread (no-op in HOSTFUNC mode, where the driver's
   // callbacks are already armed by record()).
-  //
-  // In IPC_EVENT mode this is where the fds are posted: every declared layer
-  // is announced as "enqueued" from this thread, which runs after the launch
-  // fan-out has joined, so a marker exists on the stream for each one.
   void arm();
 
   // Block until every declared layer has been posted. Returns false on a
@@ -194,13 +146,6 @@ private:
   cudaEvent_t event_for(int layer, int rank);
   void release_event_pool();
 
-  // IPC_EVENT's grid, indexed [(counter * ranks + rank) * layers + layer].
-  // Separate from event_pool_ because the two have opposite lifetimes: this
-  // one is fixed at handshake time and must never be reallocated (the handles
-  // are already in the consumer's hands), while event_pool_ grows lazily.
-  cudaEvent_t ipc_event_at(int counter, int rank, int layer) const;
-  void release_ipc_events();
-
   // Outer park/wake loop, run by poll_thread_ for the object's whole life.
   void polling_loop();
   // One transfer's worth of sweeping: walk batches_ in order, posting each
@@ -229,13 +174,6 @@ private:
   int pool_layers_ = 0;
   int pool_ranks_ = 0;
   std::vector<int> pool_device_ids_; // the devices event_pool_ was built on
-
-  // IPC_EVENT's fixed grid; see ipc_event_at().
-  std::vector<cudaEvent_t> ipc_events_;
-  int ipc_counters_ = 0;
-  int ipc_ranks_ = 0;
-  int ipc_layers_ = 0;
-  std::vector<int> ipc_device_ids_;
 
   std::atomic<bool> poll_stop_{false};
   std::atomic<int> poll_next_{0};

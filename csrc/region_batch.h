@@ -39,7 +39,6 @@
 #include "transfer_backend.h"
 
 #include <memory>
-#include <mutex>
 #include <string>
 #include <torch/extension.h>
 #include <vector>
@@ -171,44 +170,6 @@ public:
   // posted and every stream has drained. False on timeout or CUDA error.
   bool wait_layer_completion(double timeout_s, std::string *error_out);
 
-  // The asynchronous counterpart of wait_layer_completion(), for the IPC_EVENT
-  // pipeline.
-  //
-  // ``wait_layer_completion`` blocks the submitting thread until the transfer
-  // has landed, which serialises the worker: op N+1 cannot even be *enqueued*
-  // until op N's DMA is done, so the consumer of op N+1 has nothing on the
-  // stream to wait for and must block on the CPU after all. Breaking that is
-  // the whole point of the two-batch pipeline.
-  //
-  // So: record a drain marker per rank right after the launches and hand back
-  // a token. The caller polls the token and only then releases the op's source
-  // buffers, which is the same guarantee wait_layer_completion() gave --
-  // deferred instead of awaited.
-  //
-  // Returns a token > 0. Tokens are recycled once polled to completion, so a
-  // caller that drops one leaks a slot until close_completion() is called.
-  int submit_layerwise_async(const std::vector<RegionRequest> &requests,
-                             const std::vector<int> &empty_layers,
-                             int counter_id);
-
-  // Non-blocking progress check for a ``submit_layerwise_async`` token.
-  // Returns true once the transfer has drained on every rank (the token is
-  // then retired and must not be polled again); ``*ok`` reports whether it
-  // drained cleanly. Returns false while still in flight.
-  bool poll_layer_completion(int token, bool *ok, std::string *error_out);
-
-  // Release a token without waiting for it, e.g. on a teardown path.
-  void close_completion(int token);
-
-  // How many tokens are currently outstanding. Diagnostics for the pipeline
-  // depth: the whole point of the change is for this to exceed 1.
-  int inflight_completions() const;
-
-  // Pre-create the interprocess event grid IPC_EVENT mode records into, and
-  // export its handles. Both are handshake-time calls; see LayerNotifier.
-  void init_ipc_events(int num_counters, int num_layers);
-  std::string export_ipc_handles() const;
-
   // Hand over the consumer's eventfd table, shaped
   // [num_counters, tp_size, num_layers]. An empty tensor means the consumer
   // wants no per-layer notification: submit_layerwise() then degrades to
@@ -253,20 +214,6 @@ private:
   prepare(const std::vector<RegionRequest> &requests_in,
           std::vector<RegionRequest> &scratch);
 
-  // The launch half of submit_layerwise(), without any waiting policy: group
-  // by milestone layer, fan out, record markers, arm. Both the blocking and
-  // the tokenised entry points are this plus a completion strategy.
-  void launch_layerwise(const std::vector<RegionRequest> &requests,
-                        const std::vector<int> &empty_layers, int counter_id);
-
-  // One outstanding submit_layerwise_async(). The events are per rank and
-  // created once, then re-recorded: a drain marker has no identity beyond
-  // "the stream reached here", so there is nothing to carry between uses.
-  struct CompletionRecord {
-    int token = 0; // 0 means free
-    std::vector<cudaEvent_t> events;
-  };
-
   std::unique_ptr<DeviceThreadPool> pool_;
   std::vector<RegionState> regions_;
   CETransferConfig ce_config_;
@@ -277,10 +224,6 @@ private:
   // rotating request, on the caller's thread before the fan-out, so every
   // rank in a fan-out agrees on who was designated.
   int rotate_counter_ = 0;
-
-  mutable std::mutex completion_mtx_;
-  std::vector<CompletionRecord> completions_;
-  int next_completion_token_ = 1;
 };
 
 } // namespace flexkv

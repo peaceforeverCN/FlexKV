@@ -15,35 +15,6 @@ class WorkerTransferResult:
     block_results: Optional[Tuple[bool, ...]] = None
 
 
-class _DeferredCompletion:
-    """``launch_transfer`` return value meaning "launched, report it later".
-
-    The worker loop normally reports an op the moment ``launch_transfer``
-    returns, because returning *was* the completion. A pipelined layerwise op
-    breaks that: it returns once the copies are enqueued, and only a drain
-    marker can say when the source blocks are free. So it hands back this
-    sentinel and takes over the reporting itself.
-
-    A distinct type rather than ``None`` or ``NotImplemented``: the loop's
-    existing branch is a plain truthiness test, and every other falsy return
-    already means "this op failed". Confusing the two would mark a healthy
-    transfer as failed and tear down its graph.
-    """
-
-    __slots__ = ()
-
-    def __bool__(self) -> bool:  # pragma: no cover - guard against misuse
-        raise TypeError(
-            "DEFERRED_COMPLETION must be compared by identity, not truthiness"
-        )
-
-    def __repr__(self) -> str:
-        return "DEFERRED_COMPLETION"
-
-
-DEFERRED_COMPLETION = _DeferredCompletion()
-
-
 @dataclass
 class WorkerTransferOp:
     transfer_op_id: int
