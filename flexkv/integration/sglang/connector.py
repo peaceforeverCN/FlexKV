@@ -1919,7 +1919,14 @@ class FlexKVConnector:
         )
 
     def check_completed_stores(self) -> List[str]:
-        """Return rids whose stores have completed since the last call."""
+        """Return rids whose stores no longer read their source GPU slots.
+
+        A PUT reports at its task-end op (the D2H into L2, see
+        ``KVTaskManager.check_completed``), so a rid is returned once its KV is
+        in CPU and the caller may release the GPU lock. H2DISK/H2REMOTE keep
+        running from the CPU staging, which FlexKV pins until the graph drains,
+        and the engine/runtime keeps driving that tail without this rid.
+        """
         completed_rids: List[str] = []
         completed_by_rid: Dict[str, Any] = {}
 
@@ -1936,11 +1943,11 @@ class FlexKVConnector:
                 and self._store_poll_due()):
             fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
             try:
+                # Not ``completely``: waiting for the whole graph would hold the
+                # GPU lock behind L3 (H2REMOTE) latency. try_wait returns only
+                # tasks past D2H (RUNNING maps to SUCCESS) or terminal ones.
                 completed_dict = (
-                    self.kv_manager.wait(
-                        list(fk_to_rid), timeout=0.0, completely=True
-                    )
-                    or {}
+                    self.kv_manager.try_wait(list(fk_to_rid)) or {}
                 )
             except Exception as exc:  # noqa: BLE001
                 rid = next(iter(self._inflight_stores))

@@ -268,6 +268,7 @@ def test_store_completion_skips_scatter_without_inflight_stores():
         assert connector.check_completed_stores() == []
         connector._sync_ctx.scatter.assert_not_called()
         if is_leader:
+            connector.kv_manager.try_wait.assert_not_called()
             connector.kv_manager.wait.assert_not_called()
 
 
@@ -281,9 +282,7 @@ def test_store_completion_paces_leader_polls_but_keeps_scatter(monkeypatch):
     connector._sync_ctx.is_sync_leader = True
     connector._sync_ctx.scatter = MagicMock(side_effect=lambda data, channel: data)
     connector.kv_manager = MagicMock()
-    connector.kv_manager.wait.return_value = {
-        17: KVResponse(KVResponseStatus.TIMEOUT, 17, None),
-    }
+    connector.kv_manager.try_wait.return_value = {}
     connector._inflight_stores = {"request": 17}
     connector._inflight_store_contexts = {"request": SimpleNamespace(task_id=17)}
     connector._pop_context = MagicMock(return_value=SimpleNamespace(task_id=17))
@@ -291,9 +290,9 @@ def test_store_completion_paces_leader_polls_but_keeps_scatter(monkeypatch):
     poll_ticks = []
     for i in range(80):
         now[0] = 100.0 + i * tick
-        calls = connector.kv_manager.wait.call_count
+        calls = connector.kv_manager.try_wait.call_count
         assert connector.check_completed_stores() == []
-        if connector.kv_manager.wait.call_count > calls:
+        if connector.kv_manager.try_wait.call_count > calls:
             poll_ticks.append(i)
     # Immediate first poll, then gaps of 2, 4, 8, 16, 32, 32 ... ticks.
     assert poll_ticks == [0, 2, 6, 14, 30, 62]
@@ -302,7 +301,7 @@ def test_store_completion_paces_leader_polls_but_keeps_scatter(monkeypatch):
 
     # A long tick (a forward) polls right away, and progress resets pacing.
     now[0] += 0.5
-    connector.kv_manager.wait.return_value = {
+    connector.kv_manager.try_wait.return_value = {
         17: KVResponse(KVResponseStatus.SUCCESS, 17, None),
     }
     assert connector.check_completed_stores() == ["request"]
@@ -332,7 +331,7 @@ def test_store_ready_uses_leader_payload_and_dedicated_channel():
     connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_READY)
 
 
-def test_store_completion_waits_for_fully_drained_graph():
+def test_store_completion_releases_at_d2h_without_waiting_for_l3():
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector.kv_manager = MagicMock()
     connector._sync_ctx = SimpleNamespace(
@@ -347,8 +346,10 @@ def test_store_completion_waits_for_fully_drained_graph():
         return_value=SimpleNamespace(task_id=17)
     )
     connector._log_cache_op = MagicMock()
-    connector.kv_manager.wait.side_effect = [
-        {17: KVResponse(KVResponseStatus.TIMEOUT, 17, None)},
+    # try_wait omits tasks still before D2H, and reports an early-returned
+    # PUT (D2H done, H2REMOTE still running) as SUCCESS.
+    connector.kv_manager.try_wait.side_effect = [
+        {},
         {17: KVResponse(KVResponseStatus.SUCCESS, 17, None)},
     ]
 
@@ -357,10 +358,26 @@ def test_store_completion_waits_for_fully_drained_graph():
 
     assert connector.check_completed_stores() == ["request"]
     assert connector._inflight_stores == {}
-    assert connector.kv_manager.wait.call_args_list == [
-        (([17],), {"timeout": 0.0, "completely": True}),
-        (([17],), {"timeout": 0.0, "completely": True}),
+    assert connector.kv_manager.try_wait.call_args_list == [
+        (([17],), {}),
+        (([17],), {}),
     ]
+    connector.kv_manager.wait.assert_not_called()
+
+
+def test_store_completion_keeps_unready_store_tracked():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.kv_manager = MagicMock()
+    connector._sync_ctx = SimpleNamespace(is_sync_leader=True, needs_sync=False)
+    connector._inflight_stores = {"request": 17}
+    connector._inflight_store_contexts = {"request": SimpleNamespace(task_id=17)}
+    connector._log_cache_op = MagicMock()
+    connector.kv_manager.try_wait.return_value = {
+        17: KVResponse(KVResponseStatus.UNREADY, 17, None),
+    }
+
+    assert connector.check_completed_stores() == []
+    assert connector._inflight_stores == {"request": 17}
 
 
 def test_wait_store_keeps_tracking_until_fully_drained():
@@ -502,9 +519,8 @@ def test_batch_store_filters_full_and_swa_then_retains_each_owner_until_drain():
     assert launch["confirm_launch"]
     connector.kv_manager.cancel.assert_called_once_with([19])
     assert connector._inflight_stores == {"a": 17, "b": 18}
-    connector.kv_manager.wait.side_effect = [
-        {17: KVResponse(KVResponseStatus.SUCCESS, 17, None),
-         18: KVResponse(KVResponseStatus.TIMEOUT, 18, None)},
+    connector.kv_manager.try_wait.side_effect = [
+        {17: KVResponse(KVResponseStatus.SUCCESS, 17, None)},
         {18: KVResponse(KVResponseStatus.SUCCESS, 18, None)},
     ]
     assert connector.check_completed_stores() == ["a"]
@@ -552,8 +568,9 @@ def test_partial_launch_failure_keeps_uncertain_gpu_ownership():
             dict(rid="a", token_ids=range(4), kv_indices=torch.arange(4)),
         ])
     assert connector._inflight_stores == {"a": 17}
+    connector.kv_manager.try_wait.return_value = {}
     assert connector.check_completed_stores() == []
-    connector.kv_manager.wait.return_value = {
+    connector.kv_manager.try_wait.return_value = {
         17: KVResponse(KVResponseStatus.CANCELLED, 17, None),
     }
     assert connector.check_completed_stores() == ["a"]

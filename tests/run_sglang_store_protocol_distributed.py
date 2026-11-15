@@ -42,6 +42,9 @@ class _FakeKVManager:
         assert completely and timeout == 0
         return {tid: SimpleNamespace(status=SimpleNamespace(value="success")) for tid in task_ids}
 
+    def try_wait(self, task_ids):
+        return {tid: SimpleNamespace(status=SimpleNamespace(value="success")) for tid in task_ids}
+
 
 def _make_comm(rank: int, world_size: int, axis: str) -> FlexKVComm:
     rank_info = SimpleNamespace(
