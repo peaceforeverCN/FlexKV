@@ -1275,6 +1275,11 @@ class KVTaskEngine(KVTaskManager):
     ) -> Dict[PrefetchHandle, PrefetchSnapshot]:
         self.prefetch_capabilities()
         self._prefetch.demand(demand_handles)
+        # Converge before snapshotting: a query that finished since the last
+        # tick would otherwise report "planning" here, costing the caller
+        # another round trip plus a tick to learn its real outcome. Runs on the
+        # runtime thread like tick(), so this adds no concurrency.
+        self._prefetch.converge()
         return {h: self._prefetch.snapshot(h) for h in handles}
 
     @on_runtime

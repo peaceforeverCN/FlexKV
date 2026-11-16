@@ -297,6 +297,34 @@ def test_capacity_terminal_no_deadlock():
     assert c.snapshot(h).terminal and c.snapshot(h).stop_reason == "capacity"
 
 
+def test_converge_publishes_a_decided_outcome_without_waiting_for_a_tick():
+    """A control poll resolves what it can, so no caller pays a tick to learn
+    an outcome that is already known."""
+    c = PrefetchCoordinator(Backend(target=0), clock=Clock(), max_reserved_bytes=20)
+    h = c.start([1])
+    assert c.snapshot(h).state == "planning"
+    c.converge()
+    assert c.snapshot(h).terminal and c.snapshot(h).stop_reason == "complete"
+
+
+def test_decided_sessions_are_not_starved_by_the_graph_budget():
+    """Sealing claims no graph budget, so a session with nothing to transfer
+    must report immediately instead of queuing behind this tick's claimants."""
+    clock, backend = Clock(), Backend()
+    bounds = {}
+    backend.resolve = lambda context: bounds[id(context)]
+    c = PrefetchCoordinator(
+        backend, clock=clock, max_batch_graphs=1, max_reserved_bytes=20
+    )
+    busy = c.start([1] * 20, PrefetchOptions(chunk_max_blocks=4))
+    idle = c.start([2] * 20, PrefetchOptions(chunk_max_blocks=4))
+    bounds[id(c.sessions[busy].context)] = (0, 20)
+    bounds[id(c.sessions[idle].context)] = (8, 8)
+    c.tick()
+    assert len(backend.sent) == 1  # the whole budget went to the first session
+    assert c.snapshot(idle).terminal and c.snapshot(idle).stop_reason == "complete"
+
+
 def test_released_terminal_sessions_return_admission_without_waiting_for_ttl():
     clock, backend = Clock(), Backend(target=0)
     c = PrefetchCoordinator(backend, clock=clock, max_sessions=2)

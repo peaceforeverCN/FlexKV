@@ -102,6 +102,15 @@ _STORE_POLL_MAX_INTERVAL_S = max(
     _STORE_POLL_MIN_INTERVAL_S,
     float(os.getenv("FLEXKV_STORE_POLL_MAX_INTERVAL_MS", "32")) / 1000.0,
 )
+# Leader-side pacing for poll-driven prefetch verdict refreshes. Prefetch
+# readiness gates batch composition only, so the scheduler may drive it on every
+# pass; _poll_queued_prefetch is already a no-op while its progress RPC is in
+# flight, and this floor keeps a back-to-back progress stream off the
+# single-inflight control channel that get_match/launch share. MIN matches
+# TaskRuntime's 2 ms state-advance period. Setting it to 0 disables pacing.
+_PREFETCH_DRIVE_MIN_INTERVAL_S = max(
+    0.0, float(os.getenv("FLEXKV_PREFETCH_DRIVE_MIN_INTERVAL_MS", "2")) / 1000.0
+)
 # Arrival lookups (L2-only): the leader issues the admission GET when the
 # request is queued, so admission does not pay one synchronous get_match RPC
 # per request on the serial scheduler path. Unconsumed positive GETs pin CPU
@@ -2284,6 +2293,33 @@ class FlexKVConnector:
                 )
             except Exception as exc:
                 lookup.future.set_exception(exc)
+
+    def poll_prefetch_progress(self):
+        """Refresh queued-prefetch snapshots without deciding any request.
+
+        Harvests completed progress RPCs and issues the next one, so a scheduler
+        pass that builds no batch still advances readiness instead of leaving
+        every verdict until the next batch is built -- a whole forward later
+        when the scheduler yields to prefetch.
+
+        The authoritative verdict stays in check_prefetch_progress: this takes
+        no rank collective and runs on the sync leader only, so callers need not
+        agree on how often they invoke it. Best effort by design -- a transport
+        failure is surfaced and handled by that check, which every rank reaches
+        together.
+        """
+        if not self._uses_queued_prefetch() or not self._sync_ctx.is_sync_leader:
+            return
+        if not self._prefetch_sessions:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_prefetch_drive_at", 0.0) < _PREFETCH_DRIVE_MIN_INTERVAL_S:
+            return
+        self._prefetch_drive_at = now
+        try:
+            self._poll_queued_prefetch()
+        except Exception as exc:
+            logger.debug("[FlexKV] prefetch progress refresh deferred: %s", exc)
 
     def _poll_queued_prefetch(self):
         for entry in self._prefetch_sessions.values():

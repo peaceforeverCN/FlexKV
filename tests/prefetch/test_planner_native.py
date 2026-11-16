@@ -181,6 +181,78 @@ def test_partial_result_and_out_of_order_tail_recycle(
     )
 
 
+def _probe_counter(env):
+    probes = []
+
+    def query(keys):
+        probes.append(len(keys))
+        return len(keys)
+
+    env.planner._query_client = NS(batch_exists=query)
+    return probes
+
+
+def test_query_resumes_at_the_resident_prefix_instead_of_rescanning(env):
+    """The store is asked only about blocks a transfer could actually mount.
+
+    Publication is contiguous, so nothing below the resident prefix can be
+    mounted and nothing above it is reachable without the block on the
+    boundary. Probing from token 0 therefore re-asks about blocks the CPU tier
+    already holds -- the common case, at one key per round trip.
+    """
+    first = start(env)
+    env.c.tick()
+    # Land exactly one block: the tail arrives first, so the hole discards it.
+    finish(env, env.sent[1])
+    finish(env, env.sent[0], (True, False))
+    env.c.tick()
+    assert env.cpu.match(SequenceMeta(env.tokens, 4)).num_matched_blocks == 1
+    env.c.release(first)
+
+    probes = _probe_counter(env)
+    second = env.c.start(env.tokens, PrefetchOptions(chunk_max_blocks=2))
+    env.c.sessions[second].context.future.result(timeout=2)
+    assert probes == [9]  # blocks 1..9, not all ten
+    assert env.c.sessions[second].context.query_start_block == 1
+    env.c.tick()
+    assert env.c.sessions[second].start == 4
+
+
+def test_fully_resident_sequence_does_not_contact_the_store(env):
+    h = start(env)
+    for _ in range(20):
+        env.c.tick()
+        for graph in list(env.sent):
+            if graph.graph_id in env.c.graphs:
+                finish(env, graph)
+        if env.c.snapshot(h).terminal:
+            break
+    assert env.cpu.match(SequenceMeta(env.tokens, 4)).num_matched_blocks == 10
+    env.c.release(h)
+
+    probes = _probe_counter(env)
+    second = env.c.start(env.tokens, PrefetchOptions(chunk_max_blocks=2))
+    env.c.sessions[second].context.future.result(timeout=2)
+    assert probes == []
+    env.c.tick()
+    assert env.c.snapshot(second).terminal
+    assert env.c.snapshot(second).stop_reason == "complete"
+
+
+def test_resident_prefix_shrinking_under_the_query_plans_no_transfer(env):
+    """The unprobed gap left by an eviction cannot be bridged contiguously, so
+    retire instead of mounting a hole."""
+    handle = env.c.start(env.tokens, PrefetchOptions(chunk_max_blocks=2))
+    env.c.sessions[handle].context.future.result(timeout=2)
+    env.c.sessions[handle].context.query_start_block = 4
+    env.c.tick()
+    session = env.c.sessions[handle]
+    assert session.start == 0 and session.target == 0
+    assert env.c.snapshot(handle).terminal
+    assert env.c.snapshot(handle).stop_reason == "complete"
+    assert env.sent == []
+
+
 @pytest.mark.parametrize("policy", ["timeout", "best_effort"])
 def test_stop_drains_claimed_chunks_without_issuing_next(env, policy):
     h = start(env, policy=policy, timeout_budget_s=10)

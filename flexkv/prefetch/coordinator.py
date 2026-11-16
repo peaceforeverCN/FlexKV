@@ -152,6 +152,15 @@ class PrefetchCoordinator:
             self._finalize(session)
             if session.reason is not None:
                 continue
+            # Resolving and sealing claim no graph budget, so they must not
+            # queue behind max_batch_graphs claimants. Otherwise a request whose
+            # outcome is already decided -- notably one the store cannot serve
+            # at all -- waits whole ticks to learn it has nothing to wait for,
+            # and keeps blocking admission while it waits.
+            self._converge(session)
+            if session.reason is not None or session.terminal_at is not None:
+                self.sessions.move_to_end(handle)
+                continue
             if len(batch) >= self.max_batch_graphs:
                 break
             try:
@@ -173,6 +182,58 @@ class PrefetchCoordinator:
             self.backend.submit_batch(batch)
         self.reap()
         return len(batch)
+
+    def converge(self):
+        """Publish every outcome that needs no reservation.
+
+        Callable from a control round trip so a caller learns a decided outcome
+        without waiting for the next tick. Deliberately excludes _commit_ready:
+        a cache mutation failure there has ambiguous ownership and must stop the
+        runtime, not surface as one caller's RPC error.
+        """
+        for handle in list(self.sessions):
+            session = self.sessions.get(handle)
+            if session is not None:
+                self._converge(session)
+
+    def _converge(self, session):
+        """Advance a session as far as costs no reservation.
+
+        Resolve a finished metadata query and seal whatever that decides, so
+        the outcome becomes visible at the next poll rather than the next tick
+        that happens to still have graph budget for this session. Reservation
+        stays in _plan_and_claim: it allocates staging under the cache lock,
+        which does not belong on a control round trip.
+        """
+        if session.terminal_at is not None or session.reason is not None:
+            return
+        reason = get_policy(session.options.policy)(
+            "tick", self.clock(), session.deadline
+        )
+        if reason:
+            self.seal(session, reason)
+            self._finalize(session)
+            return
+        if session.target is None:
+            try:
+                bounds = self.backend.resolve(session.context)
+            except PrefetchCapacityExhausted:
+                self.seal(session, "capacity")
+                self._finalize(session)
+                return
+            except Exception as exc:
+                session.error = f"{type(exc).__name__}: {exc}"
+                self.seal(session, "backend_error")
+                self._finalize(session)
+                return
+            if bounds is None:
+                return
+            session.start, session.target = bounds
+            session.cursor = session.committed = session.start
+            session.version += 1
+        if session.cursor >= session.target:
+            self.seal(session, "complete")
+            self._finalize(session)
 
     def _plan_and_claim(self, session):
         """Reserve one chunk and record ownership before handing it to IPC."""

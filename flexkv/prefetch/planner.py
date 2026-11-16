@@ -32,6 +32,7 @@ class PrefetchContext:
     node: Any = None
     swa_node: Any = None
     swa_aware: bool = False
+    query_start_block: int = 0
     checkpoints: Tuple[int, ...] = ()
     reusable_end: int = 0
     pinned_bytes: int = 0
@@ -114,9 +115,23 @@ class MooncakeChunkPlanner:
         context.future = self.executor.submit(self._query, context)
         return context
 
+    def _resume_block(self, sequence: SequenceMeta, swa_aware: bool) -> int:
+        """The CPU-resident prefix this prefetch can extend, in blocks.
+
+        Must stay the same expression as ``resolve``: it decides where the
+        cursor starts, so the scan has to begin exactly there.
+        """
+        with self.cache._cache_tree_lock:
+            local = self.cache.cpu_cache_engine.match(sequence)
+            ready = int(local.num_matched_blocks)
+            if swa_aware:
+                ready = min(ready, int(local.swa_hit_blocks))
+        return ready
+
     def _query(self, context: PrefetchContext) -> Tuple[Optional[SequenceMeta], int]:
-        # Hashing and network queries occur without the radix lock. The query
-        # client belongs exclusively to this executor, not foreground GET/PUT.
+        # Network queries occur without the radix lock. The query client belongs
+        # exclusively to this executor, not foreground GET/PUT. Only the local
+        # boundary match below takes the cache lock, for one radix walk.
         from flexkv.external.mooncake_store_keys import PoolKind
         from flexkv.external.mooncake_store_utils import (
             MooncakeStoreClient,
@@ -132,9 +147,20 @@ class MooncakeChunkPlanner:
             )
             self._query_client = MooncakeStoreClient(config, query_only=True)
         remote = self.cache.remote_cache_engine
-        matched = 0
+        # Anchor the scan at the boundary a transfer could resume from, not at
+        # token 0. Publication is contiguous by construction (_pin_prefix
+        # asserts the published prefix is resident, and _commit_deferred_insert
+        # discards staging that starts beyond the tree), so no block below that
+        # boundary can be mounted, and no span above it is reachable unless the
+        # block sitting on the boundary exists. Scanning from 0 therefore both
+        # re-asks the store about blocks the CPU tier already holds -- the
+        # common case, and every key costs a round trip -- and hides any stored
+        # span whose own prefix has since been evicted.
+        start_block = self._resume_block(sequence, context.swa_aware)
+        context.query_start_block = start_block
+        matched = start_block
         checkpoints = []
-        for begin in range(0, sequence.num_blocks, 256):
+        for begin in range(start_block, sequence.num_blocks, 256):
             if context.cancel_query.is_set():
                 break
             hashes = sequence.block_hashes[begin : begin + 256]
@@ -164,7 +190,14 @@ class MooncakeChunkPlanner:
                 break
         context.checkpoints = tuple(checkpoints)
         if context.swa_aware:
-            matched = checkpoints[len(checkpoints) - 1] // self.block_size if checkpoints else 0
+            # Only a Full+SWA boundary can resume an SWA request, so the plan
+            # ends at the last checkpoint. Absent one, nothing beyond the
+            # resume boundary is usable.
+            matched = (
+                checkpoints[len(checkpoints) - 1] // self.block_size
+                if checkpoints
+                else start_block
+            )
         return sequence, matched
 
     def resolve(self, context: PrefetchContext) -> Optional[Tuple[int, int]]:
@@ -173,6 +206,8 @@ class MooncakeChunkPlanner:
         context.sequence, matched = context.future.result()
         if context.sequence is None:
             return 0, 0
+        # Set by _query before it scanned; result() above orders that write.
+        queried_from = context.query_start_block
         with self.cache._cache_tree_lock:
             local = self.cache.cpu_cache_engine.match(context.sequence)
             # Insert-after keeps inflight staging outside the tree: every
@@ -181,6 +216,12 @@ class MooncakeChunkPlanner:
             start = (
                 min(ready, int(local.swa_hit_blocks)) if context.swa_aware else ready
             )
+            if start < queried_from:
+                # The resident prefix shrank while the query ran, so
+                # [start, queried_from) was never probed. A contiguous
+                # publication cannot skip it and nothing above it is reachable:
+                # plan no transfer rather than mount a hole.
+                matched = start
             start *= self.block_size
             if not self._pin_prefix(context, start):
                 raise PrefetchCapacityExhausted(
