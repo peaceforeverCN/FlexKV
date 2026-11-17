@@ -1401,6 +1401,7 @@ class FlexKVLayerDoneCounter:
         if not self.pipelined:
             return
         self._pending_activation = -1
+        self._report_layer_stall()
         if counter_id < 0:
             self.consumer_index = -1
             return
@@ -1497,6 +1498,32 @@ class FlexKVLayerDoneCounter:
             self._open_producer = -1
         event.mark_reusable()
 
+    def _report_layer_stall(self) -> None:
+        """Log how long the previous forward stalled on its layerwise H2D.
+
+        This is the other half of the restore cost. The scheduler-thread
+        handoff is measured by ``[FlexKV-Restore]``; this measures the forward
+        itself blocking in ``wait_until`` because the transfer had not reached
+        the layer being computed. The two are different problems: the first is
+        serialisation that can be removed, the second says the H2D is simply
+        not keeping up with the forward and no amount of handoff tuning will
+        change it.
+        """
+        waited_ns = getattr(self, "_layer_stall_ns", 0)
+        if not waited_ns:
+            self._layer_stall_hits = 0
+            return
+        hits = getattr(self, "_layer_stall_hits", 0)
+        self._layer_stall_ns = 0
+        self._layer_stall_hits = 0
+        logger.info(
+            "[FlexKV-LayerStall] rank=%d slot=%d stalled_ms=%.3f layers=%d",
+            getattr(self, "world_rank", -1),
+            self.consumer_index,
+            waited_ns / 1e6,
+            hits,
+        )
+
     def wait_until(self, threshold: int) -> None:
         if self.consumer_index < 0:
             if self.pipelined and threshold == 0:
@@ -1508,6 +1535,7 @@ class FlexKVLayerDoneCounter:
         if wait_count <= 0:
             return
         event.wait_remaining[threshold] = 0
+        stall_begin = time.perf_counter_ns()
         try:
             event.wait(
                 threshold,
@@ -1535,6 +1563,10 @@ class FlexKVLayerDoneCounter:
                 f"rank={rank}, task_ids={task_ids}, counter_id={self.consumer_index}, "
                 f"layer={threshold}, wait_count={wait_count}"
             ) from exc
+        self._layer_stall_ns = (
+            getattr(self, "_layer_stall_ns", 0) + time.perf_counter_ns() - stall_begin
+        )
+        self._layer_stall_hits = getattr(self, "_layer_stall_hits", 0) + 1
         if threshold == self.num_layers - 1:
             if self.pipelined:
                 # Forward has issued every read of this slot. It is not free
