@@ -39,8 +39,9 @@ import signal
 import socket
 import struct
 import time
+from collections import OrderedDict
 from concurrent.futures import Future
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -633,6 +634,29 @@ class FlexKVConnector:
         context.task_id = task_id
         return context
 
+    def _stage_timer(self):
+        """Collect per-stage wall time for one operation, in milliseconds.
+
+        Attributes a cost to the caller's thread, which is what matters on the
+        scheduler path: a stage that merely queues work elsewhere reads as
+        cheap here even when the transfer it starts is long. Returns a
+        (measure, fields) pair; fields is ordered for a stable log column
+        order, and a GPU-touching stage still only reports the time the host
+        spent, so compare it against the device timeline rather than treating
+        it as device-idle.
+        """
+        fields: "OrderedDict[str, float]" = OrderedDict()
+
+        @contextmanager
+        def measure(name: str):
+            begin = time.perf_counter_ns()
+            try:
+                yield
+            finally:
+                fields[name] = (time.perf_counter_ns() - begin) / 1e6
+
+        return measure, fields
+
     def _log_cache_op(
         self,
         context: _CacheOpContext,
@@ -1119,8 +1143,7 @@ class FlexKVConnector:
         )
         load_start_ns = time.perf_counter_ns()
 
-        slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
-        swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
+        slot_mapping_cpu, swa_slot_mapping = self._restore_slot_mappings(slot_mapping)
         swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
 
         # Cross-node PP receivers must send their slot mapping back to
@@ -1208,9 +1231,16 @@ class FlexKVConnector:
             "_pending_lookup_contexts", rid, "load", fkv_task_id
         )
         load_start_ns = time.perf_counter_ns()
+        stage, stage_ms = self._stage_timer()
 
-        slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
-        swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
+        # The device-side translation and the copy back are separated because
+        # they fail differently: "xlate" only enqueues a kernel, while "d2h"
+        # is the one host wait of this call and therefore also absorbs
+        # whatever the schedule stream had queued ahead of the allocation.
+        with stage("d2h"):
+            slot_mapping_cpu, swa_slot_mapping = self._restore_slot_mappings(
+                slot_mapping
+            )
         swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
         n = slot_mapping_cpu.numel()
 
@@ -1224,19 +1254,22 @@ class FlexKVConnector:
         selected_new_counter = False
         selection_error = None
         if self._sync_ctx.is_sync_leader:
-            try:
-                if fkv_task_id < 0:
-                    raise RuntimeError(f"No pending FlexKV lookup for rid={rid}")
-                producer_id = self.layer_done_counter.update_producer()
-                selected_new_counter = (
-                    self.layer_done_counter.consumer_index != producer_id
-                )
-                expected_signal_count = self.layer_done_counter.expected_transfer_count(
-                    producer_id,
-                    allow_unclaimed_active=selected_new_counter,
-                )
-            except Exception as exc:  # noqa: BLE001
-                selection_error = str(exc)
+            with stage("counter_pick"):
+                try:
+                    if fkv_task_id < 0:
+                        raise RuntimeError(f"No pending FlexKV lookup for rid={rid}")
+                    producer_id = self.layer_done_counter.update_producer()
+                    selected_new_counter = (
+                        self.layer_done_counter.consumer_index != producer_id
+                    )
+                    expected_signal_count = (
+                        self.layer_done_counter.expected_transfer_count(
+                            producer_id,
+                            allow_unclaimed_active=selected_new_counter,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    selection_error = str(exc)
 
         manifest = {
             "cmd": CMD_LAYERWISE,
@@ -1248,10 +1281,13 @@ class FlexKVConnector:
             "error": selection_error,
         }
         if self._sync_ctx.needs_sync:
-            manifest = self._sync_ctx.scatter(
-                manifest,
-                channel=FlexKVScatterChannel.LAYERWISE_MANIFEST,
-            )
+            # Rank-collective: the cost here is the slowest rank's arrival, so
+            # read it as a skew measure, not as transport time.
+            with stage("scatter"):
+                manifest = self._sync_ctx.scatter(
+                    manifest,
+                    channel=FlexKVScatterChannel.LAYERWISE_MANIFEST,
+                )
 
         local_ok = 1
         local_error = None
@@ -1303,41 +1339,46 @@ class FlexKVConnector:
         # same all-rank preflight. Nothing reaches KVManager.launch until every
         # rank reports that it is ready to consume the leader's counter.
         if local_ok and self._sync_ctx.should_send_slot_mapping_to_remote:
-            try:
-                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu, swa_slot_mapping)
-            except Exception as exc:  # noqa: BLE001
-                local_ok = 0
-                local_error = f"remote slot metadata failed: {exc}"
+            with stage("remote_slots"):
+                try:
+                    self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu, swa_slot_mapping)
+                except Exception as exc:  # noqa: BLE001
+                    local_ok = 0
+                    local_error = f"remote slot metadata failed: {exc}"
 
         if local_ok:
-            try:
-                if self._sync_ctx.is_sync_leader:
-                    self.layer_done_counter.register_task(fkv_task_id, producer_id)
-                else:
-                    self.layer_done_counter.register_task_with_explicit_counter_id(
-                        fkv_task_id, producer_id
-                    )
-                registered = True
-                self.layer_done_counter.set_consumer(fkv_task_id)
-                transfer_added = True
-                local_signal_count = self.layer_done_counter.events[
-                    producer_id
-                ].pending_transfers()
-                if local_signal_count != expected_signal_count:
-                    raise RuntimeError(
-                        "FlexKV layerwise signal-count changed during registration: "
-                        f"local={local_signal_count}, leader={expected_signal_count}"
-                    )
-            except Exception as exc:  # noqa: BLE001
-                local_ok = 0
-                local_error = f"counter registration failed: {exc}"
+            with stage("counter_reg"):
+                try:
+                    if self._sync_ctx.is_sync_leader:
+                        self.layer_done_counter.register_task(fkv_task_id, producer_id)
+                    else:
+                        self.layer_done_counter.register_task_with_explicit_counter_id(
+                            fkv_task_id, producer_id
+                        )
+                    registered = True
+                    self.layer_done_counter.set_consumer(fkv_task_id)
+                    transfer_added = True
+                    local_signal_count = self.layer_done_counter.events[
+                        producer_id
+                    ].pending_transfers()
+                    if local_signal_count != expected_signal_count:
+                        raise RuntimeError(
+                            "FlexKV layerwise signal-count changed during registration: "
+                            f"local={local_signal_count}, leader={expected_signal_count}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    local_ok = 0
+                    local_error = f"counter registration failed: {exc}"
 
         self._layerwise_generation = generation + 1
-        all_ranks_ok = (
-            self._sync_ctx.all_reduce_min(local_ok)
-            if self._sync_ctx.needs_sync
-            else local_ok
-        )
+        if self._sync_ctx.needs_sync:
+            # Second rank-collective of this call. Paired with "scatter" it
+            # brackets the preflight, so the two together show how much of the
+            # call is spent agreeing rather than working.
+            with stage("preflight"):
+                all_ranks_ok = self._sync_ctx.all_reduce_min(local_ok)
+        else:
+            all_ranks_ok = local_ok
         if all_ranks_ok == 0:
             cleanup_ok = 1
             cleanup_error = None
@@ -1389,6 +1430,7 @@ class FlexKVConnector:
                 rank=self._sync_ctx.world_rank,
                 generation=generation,
                 producer_id=producer_id,
+                **stage_ms,
                 error=local_error or "another rank rejected the pre-launch state",
             )
             return 0, -1
@@ -1407,14 +1449,15 @@ class FlexKVConnector:
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                launched_task_ids = self.kv_manager.launch(
-                    task_ids=[fkv_task_id],
-                    slot_mappings=[slot_mapping_cpu],
-                    swa_slot_mappings=[swa_slot_mapping],
-                    as_batch=True,
-                    layerwise_transfer=True,
-                    counter_id=producer_id,
-                )
+                with stage("launch"):
+                    launched_task_ids = self.kv_manager.launch(
+                        task_ids=[fkv_task_id],
+                        slot_mappings=[slot_mapping_cpu],
+                        swa_slot_mappings=[swa_slot_mapping],
+                        as_batch=True,
+                        layerwise_transfer=True,
+                        counter_id=producer_id,
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._log_cache_op(
                     context,
@@ -1424,6 +1467,7 @@ class FlexKVConnector:
                     direction="H2D",
                     transfer_mode="layerwise",
                     stage="launch",
+                    **stage_ms,
                     error=str(exc),
                 )
                 raise
@@ -1437,6 +1481,11 @@ class FlexKVConnector:
                     task_id=launched_task_id,
                     start_ns=load_start_ns,
                 )
+            # Stage breakdown rides the launch line because it is the one that
+            # always logs at INFO. "blocked" is the share of this call the
+            # scheduler thread could not spend elsewhere; the transfer itself
+            # is reported later, by the completion sweep.
+            blocked_ms = (time.perf_counter_ns() - load_start_ns) / 1e6
             self._log_cache_op(
                 context,
                 "launch",
@@ -1447,6 +1496,8 @@ class FlexKVConnector:
                 slots=n,
                 swa_slots=swa_slots,
                 producer_id=producer_id,
+                blocked=blocked_ms,
+                **stage_ms,
             )
 
         return n, producer_id
@@ -3496,6 +3547,55 @@ class FlexKVConnector:
             return None
         swa_indices = translate(full_indices).to(device="cpu", dtype=torch.int64)
         return self._trim_swa_slot_mapping(swa_indices)
+
+    def _restore_slot_mappings(
+        self, slot_mapping: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Host copies of the full and SWA slot mappings with one host wait.
+
+        Two independent ``.cpu()`` calls meant two *pageable* D2H copies, and
+        each of those ends in ``cudaStreamSynchronize``. On the restore path
+        that runs on the scheduler thread with a forward in flight, so the
+        wait is not the 600KB -- it is whatever the schedule stream still has
+        queued, twice over. Here both copies are issued non-blocking into the
+        caching pinned allocator and a single stream synchronise retires them,
+        which is also the only form the copy engine can run at full rate.
+
+        The buffers are allocated per mapping rather than carved out of one
+        block: these tensors are pickled onto the FlexKV control socket, and
+        a view would serialise its whole base storage.
+        """
+        if not slot_mapping.is_cuda:
+            return (
+                self._to_cpu_int64(slot_mapping),
+                self._build_swa_slot_mapping(slot_mapping),
+            )
+
+        full_device = slot_mapping.to(torch.int64)
+        swa_device = None
+        if self._swa_kv_pool is not None:
+            translate = getattr(self._kvcache, "translate_loc_from_full_to_swa", None)
+            if translate is not None:
+                swa_device = translate(slot_mapping).to(torch.int64)
+
+        slot_mapping_cpu = torch.empty(
+            full_device.numel(), dtype=torch.int64, pin_memory=True
+        )
+        slot_mapping_cpu.copy_(full_device, non_blocking=True)
+        swa_cpu = None
+        if swa_device is not None:
+            swa_cpu = torch.empty(
+                swa_device.numel(), dtype=torch.int64, pin_memory=True
+            )
+            swa_cpu.copy_(swa_device, non_blocking=True)
+        torch.cuda.current_stream(slot_mapping.device).synchronize()
+
+        if swa_cpu is None:
+            return slot_mapping_cpu, None
+        swa_tail = self._trim_swa_slot_mapping(swa_cpu)
+        # The tail is a short suffix of a long buffer; detach it so the
+        # control frame carries the page, not the whole translation.
+        return slot_mapping_cpu, None if swa_tail is None else swa_tail.clone()
 
     @staticmethod
     def _trim_swa_slot_mapping(

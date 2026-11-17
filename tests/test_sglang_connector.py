@@ -149,3 +149,61 @@ def test_legacy_cancel_prefetch_cancels_lookup_and_prefetch_tasks():
         [22],
     ]
     assert not connector._pending_lookups and not connector._ongoing_prefetches
+
+
+def _restore_mapping_connector(swa_pool, translate=None):
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._swa_kv_pool = swa_pool
+    connector._kvcache = SimpleNamespace(
+        **({} if translate is None else {"translate_loc_from_full_to_swa": translate})
+    )
+    return connector
+
+
+def test_restore_mappings_without_an_swa_pool_return_only_the_full_mapping():
+    connector = _restore_mapping_connector(None)
+    slots = torch.arange(4, dtype=torch.int64)
+
+    full, swa = connector._restore_slot_mappings(slots)
+
+    assert swa is None
+    assert torch.equal(full, slots)
+    assert full.dtype == torch.int64
+
+
+def test_restore_mappings_keep_only_the_mapped_swa_tail():
+    # The allocator maps the SWA sidecar for the tail page alone, so the
+    # translation of the earlier slots reads as unmapped and must be dropped
+    # before the mapping reaches FlexKV.
+    translated = torch.tensor([0, 0, 8, 9], dtype=torch.int64)
+    connector = _restore_mapping_connector(
+        object(), translate=lambda _slots: translated
+    )
+    slots = torch.arange(40, 44, dtype=torch.int64)
+
+    full, swa = connector._restore_slot_mappings(slots)
+
+    assert torch.equal(full, slots)
+    assert torch.equal(swa, torch.tensor([8, 9], dtype=torch.int64))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_restore_mappings_land_in_pinned_memory_on_one_host_wait():
+    # Pageable copies were two separate cudaStreamSynchronize calls on the
+    # scheduler thread. The replacement must still produce detached, own-
+    # storage tensors: they are pickled onto the FlexKV control socket, where
+    # a view would carry its whole base buffer.
+    translated = torch.cat(
+        [torch.zeros(6, dtype=torch.int64), torch.tensor([3, 4], dtype=torch.int64)]
+    ).cuda()
+    connector = _restore_mapping_connector(
+        object(), translate=lambda _slots: translated
+    )
+    slots = torch.arange(100, 108, dtype=torch.int64, device="cuda")
+
+    full, swa = connector._restore_slot_mappings(slots)
+
+    assert full.device.type == "cpu" and full.is_pinned()
+    assert torch.equal(full, torch.arange(100, 108, dtype=torch.int64))
+    assert torch.equal(swa, torch.tensor([3, 4], dtype=torch.int64))
+    assert swa.numel() * swa.element_size() == swa.untyped_storage().nbytes()
