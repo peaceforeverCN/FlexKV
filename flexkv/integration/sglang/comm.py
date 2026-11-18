@@ -989,6 +989,30 @@ class FlexKVLayerLoadingEvent:
         for layer_index in range(self._num_layers):
             self.wait_remaining[layer_index] += 1
 
+    def collapse_transfers(self, count: int = 1) -> None:
+        """Rewrite the per-layer expectation to the number of transfers that
+        will actually signal this slot.
+
+        ``add_transfer`` counts *admissions*, which is what the ranks
+        cross-check their batch boundary with during preflight. What signals a
+        layer, though, is a *submitted* transfer: the worker records the layer
+        event once per layerwise op, and the merged graph's spans are disjoint
+        layer ranges, so every layer gets exactly one token per merged graph --
+        no matter how many requests were folded into it.
+
+        The connector merges a batch's restores into one layer-major transfer,
+        so leaving one token per request would leave every layer short by
+        ``requests - 1`` signals and hang the forward. Called at the seal, i.e.
+        after preflight has finished using the admission count and before any
+        layer wait can start. Symmetric on every rank: the merge rule is
+        deterministic, so no collective is needed.
+        """
+        if self._finished or self._wait_started:
+            raise RuntimeError("Cannot collapse transfers after layer waits have started")
+        if count < 1:
+            raise ValueError(f"collapse_transfers needs a positive count, got {count}")
+        self.wait_remaining = [count] * self._num_layers
+
     def mark_reusable(self) -> None:
         """Return this slot to the producer ring after transfer quiescence.
 
@@ -1384,6 +1408,9 @@ class FlexKVLayerDoneCounter:
             # Nothing actually registered against it; give it straight back.
             self.events[slot].mark_reusable()
             return -1
+        # The batch's restores leave here as one merged, layer-major transfer,
+        # which signals each layer once. Admission counted one per request.
+        self.events[slot].collapse_transfers(1)
         # Record that this slot is waiting to be named to a forward. If one
         # runs without that happening, the integration is broken in a way that
         # would otherwise be silent -- see _assert_activated.

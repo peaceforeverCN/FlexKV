@@ -136,6 +136,40 @@ class _CacheOpContext:
 
 
 @dataclass
+class _PendingLayerwiseLaunch:
+    """One restore that is registered on the open producer slot but not yet
+    handed to FlexKV.
+
+    Launching per request makes the transfer request-major: every request is
+    its own ``launch`` call, so its 40 layer groups are enqueued back-to-back
+    on the worker's single per-device stream before the next request's layer 0
+    is even submitted. The layer-completion events are indexed by
+    ``[slot, rank, layer]``, so each request re-records the same 40 events and
+    the surviving recording is the last one -- i.e. "layer 0 is ready" really
+    means "every earlier request finished all 40 layers". Layerwise degrades
+    into wait-for-everything.
+
+    Collecting a batch and launching once makes it layer-major instead:
+    ``merge_to_batch_graph`` concatenates the block ids into a single
+    ``LayerwiseTransferOp`` and the C++ launcher sorts the region requests by
+    ``milestone_layer``, so layer L of all requests is enqueued together and
+    its event is recorded once, behind exactly that layer.
+    """
+
+    rid: Optional[str]
+    task_id: int
+    slot_mapping: np.ndarray
+    swa_slot_mapping: Optional[np.ndarray]
+    context: _CacheOpContext
+    start_ns: int
+    producer_id: int
+    generation: int
+    slots: int
+    swa_slots: int
+    stage_ms: dict
+
+
+@dataclass
 class _StoreAdmission:
     """Owned CPU snapshots retained through reservation, launch, and reset."""
 
@@ -550,6 +584,11 @@ class FlexKVConnector:
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
         self._launched_load_contexts: Dict[int, _CacheOpContext] = {}
+        # Leader-only: restores registered against the still-open producer slot
+        # whose launch is deferred to the batch seal. See
+        # _flush_layerwise_launch_batch for why the deferral is what makes
+        # layerwise transfer actually layerwise.
+        self._pending_layerwise_launch: List[_PendingLayerwiseLaunch] = []
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
@@ -1448,59 +1487,124 @@ class FlexKVConnector:
         )
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            try:
-                with stage("launch"):
-                    launched_task_ids = self.kv_manager.launch(
-                        task_ids=[fkv_task_id],
-                        slot_mappings=[slot_mapping_cpu],
-                        swa_slot_mappings=[swa_slot_mapping],
-                        as_batch=True,
-                        layerwise_transfer=True,
-                        counter_id=producer_id,
-                    )
-            except Exception as exc:  # noqa: BLE001
+            # A producer slot is per batch, so pending entries always belong to
+            # the open one. A different slot here means the previous batch was
+            # never sealed (no restore reached ready_to_load_host_cache); flush
+            # it rather than let its entries ride a foreign counter.
+            if (
+                self._pending_layerwise_launch
+                and self._pending_layerwise_launch[0].producer_id != producer_id
+            ):
+                self._flush_layerwise_launch_batch(source="slot_rollover")
+            self._pending_layerwise_launch.append(
+                _PendingLayerwiseLaunch(
+                    rid=rid,
+                    task_id=fkv_task_id,
+                    slot_mapping=slot_mapping_cpu,
+                    swa_slot_mapping=swa_slot_mapping,
+                    context=context,
+                    start_ns=load_start_ns,
+                    producer_id=producer_id,
+                    generation=generation,
+                    slots=n,
+                    swa_slots=swa_slots,
+                    stage_ms=dict(stage_ms),
+                )
+            )
+            # Without the pipeline there is no batch seal to flush on, so the
+            # batch is exactly this one request and it goes out immediately.
+            if not self.layerwise_pipelined:
+                self._flush_layerwise_launch_batch(source="unpipelined")
+            else:
+                # "blocked" is the share of this call the scheduler thread
+                # could not spend elsewhere. Deferral is the point of the
+                # batching, so record what the per-request part cost; the
+                # merged launch reports its own cost at flush.
                 self._log_cache_op(
                     context,
+                    "defer",
+                    "pending",
+                    direction="H2D",
+                    transfer_mode="layerwise",
+                    slots=n,
+                    swa_slots=swa_slots,
+                    producer_id=producer_id,
+                    pending=len(self._pending_layerwise_launch),
+                    blocked=(time.perf_counter_ns() - load_start_ns) / 1e6,
+                    **stage_ms,
+                )
+
+        return n, producer_id
+
+    def _flush_layerwise_launch_batch(self, source: str = "seal") -> None:
+        """Hand every restore registered on the open slot to FlexKV as one
+        merged, layer-major transfer. Leader-only; safe to call when empty."""
+        pending = self._pending_layerwise_launch
+        if not pending:
+            return
+        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            self._pending_layerwise_launch = []
+            return
+        self._pending_layerwise_launch = []
+
+        producer_id = pending[0].producer_id
+        mismatched = [e.producer_id for e in pending if e.producer_id != producer_id]
+        assert not mismatched, (
+            "FlexKV layerwise batch mixes producer slots: "
+            f"{producer_id} vs {mismatched}"
+        )
+        flush_start_ns = time.perf_counter_ns()
+        try:
+            launched_task_ids = self.kv_manager.launch(
+                task_ids=[e.task_id for e in pending],
+                slot_mappings=[e.slot_mapping for e in pending],
+                swa_slot_mappings=[e.swa_slot_mapping for e in pending],
+                as_batch=True,
+                layerwise_transfer=True,
+                counter_id=producer_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            for entry in pending:
+                self._log_cache_op(
+                    entry.context,
                     "complete",
                     "failed",
-                    start_ns=load_start_ns,
+                    start_ns=entry.start_ns,
                     direction="H2D",
                     transfer_mode="layerwise",
                     stage="launch",
-                    **stage_ms,
+                    **entry.stage_ms,
                     error=str(exc),
                 )
-                raise
-            # A layerwise launch is always merged into a batch task. Track the
-            # IDs returned by launch(), not the lookup task ID that the merge
-            # removes from FlexKV's task table.
-            self._launched_load_tids.extend(launched_task_ids)
-            for launched_task_id in launched_task_ids:
-                self._launched_load_contexts[launched_task_id] = replace(
-                    context,
-                    task_id=launched_task_id,
-                    start_ns=load_start_ns,
-                )
-            # Stage breakdown rides the launch line because it is the one that
-            # always logs at INFO. "blocked" is the share of this call the
-            # scheduler thread could not spend elsewhere; the transfer itself
-            # is reported later, by the completion sweep.
-            blocked_ms = (time.perf_counter_ns() - load_start_ns) / 1e6
+            raise
+        # A layerwise launch is always merged into a batch task. Track the
+        # IDs returned by launch(), not the lookup task IDs that the merge
+        # removes from FlexKV's task table.
+        self._launched_load_tids.extend(launched_task_ids)
+        for launched_task_id in launched_task_ids:
+            self._launched_load_contexts[launched_task_id] = replace(
+                pending[0].context,
+                task_id=launched_task_id,
+                start_ns=pending[0].start_ns,
+            )
+        launch_ms = (time.perf_counter_ns() - flush_start_ns) / 1e6
+        for entry in pending:
             self._log_cache_op(
-                context,
+                entry.context,
                 "launch",
                 "running",
                 direction="H2D",
                 flexkv_batch_task_ids=launched_task_ids,
                 transfer_mode="layerwise",
-                slots=n,
-                swa_slots=swa_slots,
+                slots=entry.slots,
+                swa_slots=entry.swa_slots,
                 producer_id=producer_id,
-                blocked=blocked_ms,
-                **stage_ms,
+                merged=len(pending),
+                merge_source=source,
+                launch_ms=launch_ms,
+                blocked=(time.perf_counter_ns() - entry.start_ns) / 1e6,
+                **entry.stage_ms,
             )
-
-        return n, producer_id
 
     def drain_launched_loads(self, threshold: int = 1) -> None:
         """Periodic non-blocking sweep on long-lived launched tasks so the
@@ -2740,6 +2844,11 @@ class FlexKVConnector:
             return -1
         if not self.layer_done_counter.pipelined:
             return -1
+        # Admission is over, so the batch's restores are all registered on the
+        # open slot: this is the first and last moment at which they can be
+        # merged into one layer-major transfer, and it is still ahead of the
+        # forward that waits on the slot.
+        self._flush_layerwise_launch_batch(source="seal")
         return self.layer_done_counter.seal_producer()
 
     def activate_layerwise_consumer(self, counter_id: int) -> None:
@@ -2796,6 +2905,10 @@ class FlexKVConnector:
 
     def reset(self) -> None:
         self._drain_pending_store_batch()
+        # A deferred batch holds registered transfers that the counter is
+        # already waiting for. Launch it before the drain below, or the wait
+        # would be for tasks that were never handed over.
+        self._flush_layerwise_launch_batch(source="reset")
         if self._uses_queued_prefetch():
             for rid in list(self._prefetch_sessions):
                 self.cancel_prefetch(rid)
