@@ -6,11 +6,13 @@ worker each; ``op.pool_id`` selects which. Layerwise (per-layer eventfd)
 delivery is a completion contract on this worker, not a separate class.
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch.multiprocessing import Queue as MPQueue
 
@@ -713,12 +715,26 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             GLOBAL_CONFIG_FROM_ENV.layerwise_pipeline)
         self._layerwise_max_inflight = max(
             1, int(GLOBAL_CONFIG_FROM_ENV.layerwise_max_inflight))
-        # (token, op_id, deadline, keepalive) per launched-but-undrained op.
-        # ``keepalive`` is the whole reason this list holds tuples rather than
-        # tokens: it pins the op's pinned block-id tensors, which the DMA is
-        # still reading. Dropping them here would hand the allocator back
-        # memory a copy engine is mid-flight on.
-        self._layerwise_inflight: List[Tuple[int, int, float, Any]] = []
+        # (token, op_id_or_ids, deadline, keepalive) per launched-but-undrained
+        # op. ``keepalive`` is the whole reason this list holds tuples rather
+        # than tokens: it pins the op's pinned block-id tensors, which the DMA
+        # is still reading. Dropping them here would hand the allocator back
+        # memory a copy engine is mid-flight on. ``op_id_or_ids`` is a tuple
+        # when one submission covers several merged ops.
+        self._layerwise_inflight: List[Tuple[int, Any, float, Any]] = []
+        # Experimental: merge the layerwise ops of one prefill batch into a
+        # single C++ submission. The C++ side already groups requests by
+        # milestone_layer, so one submission orders the GPU kernels by layer
+        # (as HiCache does) instead of by request, and records one marker per
+        # layer that covers every request in the batch. Off by default.
+        self._merge_layerwise_batch = (
+            os.environ.get("FLEXKV_LAYERWISE_MERGE_BATCH", "0") == "1"
+            and self._layerwise_pipeline)
+        self._merge_pending: Dict[int, List[Any]] = {}
+        if self._merge_layerwise_batch:
+            flexkv_logger.info(
+                "[worker %s] FLEXKV_LAYERWISE_MERGE_BATCH=1: batch layerwise "
+                "ops are merged into one submission", self.worker_id)
 
         if not self._completion.needs_eventfd:
             return
@@ -1504,7 +1520,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 self._layerwise_completion_timeout_s)
             for token, op_id, _, _ in self._layerwise_inflight:
                 self.region_batch.close_completion(token)
-                self._report_layerwise_result(op_id, False)
+                self._report_layerwise_results(op_id, False)
             self._layerwise_inflight.clear()
 
     def _reap_layerwise(self, *, block: bool) -> None:
@@ -1521,7 +1537,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         if not self._layerwise_inflight:
             return
         while self._layerwise_inflight:
-            still: List[Tuple[int, int, float, Any]] = []
+            still: List[Tuple[int, Any, float, Any]] = []
             progressed = False
             for token, op_id, deadline, keepalive in self._layerwise_inflight:
                 done, ok, err = self.region_batch.poll_layer_completion(token)
@@ -1530,20 +1546,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                         self.region_batch.close_completion(token)
                         progressed = True
                         flexkv_logger.error(
-                            "[worker %s] layerwise op %d did not drain within "
+                            "[worker %s] layerwise op %s did not drain within "
                             "%.1fs; reporting failure",
                             self.worker_id, op_id,
                             self._layerwise_completion_timeout_s)
-                        self._report_layerwise_result(op_id, False)
+                        self._report_layerwise_results(op_id, False)
                         continue
                     still.append((token, op_id, deadline, keepalive))
                     continue
                 progressed = True
                 if not ok:
                     flexkv_logger.error(
-                        "[worker %s] layerwise op %d failed to drain: %s",
+                        "[worker %s] layerwise op %s failed to drain: %s",
                         self.worker_id, op_id, err)
-                self._report_layerwise_result(op_id, bool(ok))
+                self._report_layerwise_results(op_id, bool(ok))
             self._layerwise_inflight = still
             if not block:
                 return
@@ -1553,6 +1569,14 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 # Every slot is busy and nothing moved: yield rather than spin
                 # a core. Short enough not to matter against a transfer.
                 time.sleep(0.0002)
+
+    def _report_layerwise_results(self, op_ids: Any, ok: bool) -> None:
+        """One merged submission owns one token but several upstream op ids."""
+        if isinstance(op_ids, (tuple, list)):
+            for op_id in op_ids:
+                self._report_layerwise_result(op_id, ok)
+        else:
+            self._report_layerwise_result(op_ids, ok)
 
     def _report_layerwise_result(self, op_id: int, ok: bool) -> None:
         try:
@@ -1613,8 +1637,129 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         ))
         return DEFERRED_COMPLETION
 
+    def flush_layerwise_group(self) -> None:
+        """Submit the ops collected since the last input-pipe drain.
+
+        One prefill batch shares one counter_id. Submitting all of its ops in a
+        single C++ call lets ``launch_layerwise`` group the kernels by
+        milestone_layer, so the GPU executes layer 0 of every request before
+        layer 1 of any request, and one marker per layer covers the whole
+        batch. That is the ordering HiCache gets from ``merge_ops``.
+        """
+        if not self._merge_pending:
+            return
+        pending, self._merge_pending = self._merge_pending, {}
+        for counter_id in sorted(pending):
+            ops = pending[counter_id]
+            if len(ops) == 1:
+                self._submit_layerwise_single(ops[0])
+            else:
+                self._submit_layerwise_group(ops)
+
+    def _submit_layerwise_single(self, op: Any) -> None:
+        status = self._launch_layerwise(op)
+        if status is DEFERRED_COMPLETION:
+            return
+        self._report_layerwise_result(op.transfer_op_id, bool(status))
+
+    def _submit_layerwise_group(self, ops: List[Any]) -> None:
+        ref = ops[0]
+        compatible = all(
+            o.counter_id == ref.counter_id
+            and o.layer_id == ref.layer_id
+            and o.layer_granularity == ref.layer_granularity
+            and (o.swa_src_block_ids_h2d.size > 0)
+                == (ref.swa_src_block_ids_h2d.size > 0)
+            for o in ops[1:]
+        )
+        if not compatible:
+            flexkv_logger.warning(
+                "[worker %s] incompatible layerwise ops in counter %d; "
+                "falling back to per-op submission",
+                self.worker_id, ref.counter_id)
+            for op in ops:
+                self._submit_layerwise_single(op)
+            return
+
+        n = len(ops)
+        all_layers = list(range(self.num_layers))
+
+        def post_tokens(count: int) -> None:
+            # submit_layerwise([], all_layers) only calls post_empty() for each
+            # layer: one eventfd token per layer, no kernel and no drain marker.
+            for _ in range(count):
+                try:
+                    self.region_batch.submit_layerwise(
+                        [], all_layers, ref.counter_id)
+                except Exception as exc:  # noqa: BLE001
+                    flexkv_logger.error(
+                        "[worker %s] failed to post a layer token for counter "
+                        "%d: %s", self.worker_id, ref.counter_id, exc)
+
+        real_posted = False
+        try:
+            src = torch.from_numpy(np.concatenate(
+                [o.src_block_ids_h2d for o in ops])).to(
+                    dtype=torch.int64).pin_memory()
+            dst = torch.from_numpy(np.concatenate(
+                [o.dst_block_ids_h2d for o in ops])).to(
+                    dtype=torch.int64).pin_memory()
+            if ref.swa_src_block_ids_h2d.size > 0:
+                swa_src = torch.from_numpy(np.concatenate(
+                    [o.swa_src_block_ids_h2d for o in ops])).to(
+                        dtype=torch.int64).pin_memory()
+                swa_dst = torch.from_numpy(np.concatenate(
+                    [o.swa_dst_block_ids_h2d for o in ops])).to(
+                        dtype=torch.int64).pin_memory()
+            else:
+                swa_src = swa_dst = None
+
+            if self._layerwise_pipeline:
+                self._reap_layerwise(block=True)
+            # One real submission; C++ groups the merged block ids by layer and
+            # records one IPC marker per layer covering all n requests.
+            token = self._layerwise_transfer_impl(
+                src, dst, swa_src, swa_dst, ref.counter_id,
+                layer_id=int(getattr(ref, "layer_id", 0) or 0),
+                layer_granularity=int(
+                    getattr(ref, "layer_granularity", -1) or -1),
+            )
+            real_posted = True
+            # The consumer expects one token per restore, so post the other
+            # n-1 after the real markers are on the stream.
+            post_tokens(n - 1)
+            flexkv_logger.info(
+                "[FlexKV-Merge] worker=%s counter=%d ops=%d layers=%d "
+                "tokens_per_layer=%d", self.worker_id, ref.counter_id,
+                n, len(all_layers), n)
+            if token is None:
+                for op in ops:
+                    self._report_layerwise_result(op.transfer_op_id, True)
+                return
+            op_ids = tuple(o.transfer_op_id for o in ops)
+            self._layerwise_inflight.append((
+                token, op_ids,
+                time.monotonic() + self._layerwise_completion_timeout_s,
+                (src, dst, swa_src, swa_dst),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            flexkv_logger.error(
+                "[worker %s] merged layerwise submission failed for %d ops in "
+                "counter %d: %s", self.worker_id, n, ref.counter_id, exc,
+                exc_info=True)
+            # Keep the consumer out of a deadlock: it still expects n tokens
+            # per layer even when the transfer itself failed.
+            if not real_posted:
+                post_tokens(n)
+            for op in ops:
+                self._report_layerwise_result(op.transfer_op_id, False)
+
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):
+            if self._merge_layerwise_batch:
+                self._merge_pending.setdefault(
+                    int(transfer_op.counter_id), []).append(transfer_op)
+                return DEFERRED_COMPLETION
             return self._launch_layerwise(transfer_op)
         # Keep the unified worker safe if a whole-op transfer is sent to a
         # PER_LAYER instance. Register before exposing shared-slot ID views;

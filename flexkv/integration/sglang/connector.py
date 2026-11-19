@@ -136,6 +136,32 @@ class _CacheOpContext:
 
 
 @dataclass
+class _PendingRetrieve:
+    """One non-layerwise restore that has been launched but not waited on.
+
+    The synchronous path (`retrieve_kv`) makes the scheduler thread block in
+    ``kv_manager.wait`` for the whole H2D, serialised in front of the forward
+    that needs the data. That is exactly the blocking handoff the layerwise
+    path exists to avoid, and it is why turning layerwise off costs more than
+    the copy itself.
+
+    Deferring only the wait, not the launch, is enough to overlap it: the
+    scheduler assembles batch N+1 while batch N is still in forward, so a wait
+    issued at the batch seal finds the copy already finished. Data safety does
+    not depend on the timing -- the destination slots are owned by the restore
+    lease from launch until commit, and nothing reads them before the forward.
+    """
+
+    rid: str
+    task_id: int
+    context: _CacheOpContext
+    start_ns: int
+    slots: int
+    swa_slots: int
+    transfer_mode: str
+
+
+@dataclass
 class _PendingLayerwiseLaunch:
     """One restore that is registered on the open producer slot but not yet
     handed to FlexKV.
@@ -553,6 +579,15 @@ class FlexKVConnector:
             )
             self._send_eventfds_to_worker()
         self._layerwise_generation = 0
+        # Non-layerwise restores normally block the scheduler on `launch` +
+        # `wait`, which is the very handoff layerwise exists to avoid. Opting
+        # in here keeps the same transfer mode but splits the wait out of
+        # init_load_back, so the H2D overlaps the forward already in flight and
+        # is only awaited when the batch is sealed. Meaningless (and off) when
+        # layerwise is on: that path already hands the wait to the KV pool.
+        self.defer_retrieve_wait = (not self.enable_layerwise) and bool(
+            int(os.environ.get("FLEXKV_RESTORE_DEFER_WAIT", "0"))
+        )
 
         # 9. Wait for the KVManager (and its remote subprocess) to be ready.
         if self._sync_ctx.is_sync_leader:
@@ -589,6 +624,10 @@ class FlexKVConnector:
         # _flush_layerwise_launch_batch for why the deferral is what makes
         # layerwise transfer actually layerwise.
         self._pending_layerwise_launch: List[_PendingLayerwiseLaunch] = []
+        # Leader-only: non-layerwise restores whose launch went out but whose
+        # completion is not awaited yet. Only used when the caller opted into
+        # the deferred handoff; otherwise retrieve_kv stays synchronous.
+        self._pending_retrieves: List[_PendingRetrieve] = []
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
@@ -1174,9 +1213,31 @@ class FlexKVConnector:
         responsible for having allocated ``slot_mapping`` of length
         equal to ``hit_length`` from a prior ``lookup_kv``.
         """
+        entry = self._post_retrieve(rid, slot_mapping)
+        if entry is None:
+            return 0
+        return self._settle_retrieves([entry])[0]
+
+    def retrieve_kv_launch(self, rid: str, slot_mapping: torch.Tensor) -> bool:
+        """Submit the H2D without waiting for it when the deferral is on.
+
+        Returns whether a completion is outstanding for this rid. With
+        ``defer_retrieve_wait`` set the completion is held in
+        ``_pending_retrieves`` and collected at the batch seal instead, so the
+        copy runs underneath the forward that is already in flight rather than
+        in front of the scheduler.
+        """
+        if not self.defer_retrieve_wait:
+            return self.retrieve_kv(rid, slot_mapping) > 0
+        return self._post_retrieve(rid, slot_mapping) is not None
+
+    def _post_retrieve(
+        self, rid: str, slot_mapping: torch.Tensor
+    ) -> Optional[_PendingRetrieve]:
+        """Issue ``launch`` for one restore and describe the outstanding copy."""
         fkv_task_id = self._pending_lookups.pop(rid, -1)
         if fkv_task_id < 0:
-            return 0
+            return None
         context = self._pop_context(
             "_pending_lookup_contexts", rid, "load", fkv_task_id
         )
@@ -1192,6 +1253,15 @@ class FlexKVConnector:
             self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu, swa_slot_mapping)
 
         n = slot_mapping_cpu.numel()
+        entry = _PendingRetrieve(
+            rid=rid,
+            task_id=fkv_task_id,
+            context=context,
+            start_ns=load_start_ns,
+            slots=n,
+            swa_slots=swa_slots,
+            transfer_mode="no-layerwise",
+        )
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 self.kv_manager.launch(
@@ -1222,36 +1292,88 @@ class FlexKVConnector:
                 slots=n,
                 swa_slots=swa_slots,
             )
+        if self.defer_retrieve_wait:
+            self._pending_retrieves.append(entry)
+        return entry
+
+    def flush_pending_retrieves(self) -> int:
+        """Settle every deferred restore in one RPC and release the batch.
+
+        Returns the number of requests that could not be restored; the caller
+        must treat a non-zero return as fatal, because admission already
+        counted these slots as cached. One ``wait`` for the whole batch also
+        keeps the per-request cost down to a single launch RPC.
+
+        Skipping when empty is rank-symmetric: a restore is admitted, and so
+        posted to ``_pending_retrieves``, on every rank or on none (the hit
+        length and the task id both arrive through ``lookup_kv``'s scatter).
+        That keeps share=0 batches -- which restore nothing -- free of any
+        extra collective.
+        """
+        if not self._pending_retrieves:
+            return 0
+        entries = self._pending_retrieves
+        self._pending_retrieves = []
+        results = self._settle_retrieves(entries)
+        return sum(1 for loaded, entry in zip(results, entries) if loaded < entry.slots)
+
+    def _settle_retrieves(self, entries: List[_PendingRetrieve]) -> List[int]:
+        """Wait on a group of non-layerwise restores and report each result.
+
+        Only the leader talks to FlexKV; followers mirror the leader's verdict
+        through the same collective the sync path used, so every rank agrees on
+        what was loaded before the forward reads those slots.
+        """
+        task_ids = [entry.task_id for entry in entries]
+        loaded: List[int] = [entry.slots for entry in entries]
+        leader_failed = 0
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                resp = self.kv_manager.wait([fkv_task_id], timeout=30.0) or {}
+                resp = self.kv_manager.wait(task_ids, timeout=30.0) or {}
             except Exception as exc:  # noqa: BLE001
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "failed",
-                    start_ns=load_start_ns,
-                    direction="H2D",
-                    transfer_mode="no-layerwise",
-                    error=str(exc),
-                )
+                for entry in entries:
+                    self._log_cache_op(
+                        entry.context,
+                        "complete",
+                        "failed",
+                        start_ns=entry.start_ns,
+                        direction="H2D",
+                        transfer_mode=entry.transfer_mode,
+                        slots=entry.slots,
+                        swa_slots=entry.swa_slots,
+                        stage="wait",
+                        error=str(exc),
+                    )
                 raise
-            status = _status_value(resp.get(fkv_task_id))
-            success = status == KVResponseStatus.SUCCESS.value
-            self._log_cache_op(
-                context,
-                "complete",
-                status,
-                start_ns=load_start_ns,
-                direction="H2D",
-                transfer_mode="no-layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-            )
-            if not success:
-                n = 0
+            for index, entry in enumerate(entries):
+                status = _status_value(resp.get(entry.task_id))
+                success = status == KVResponseStatus.SUCCESS.value
+                self._log_cache_op(
+                    entry.context,
+                    "complete",
+                    status,
+                    start_ns=entry.start_ns,
+                    direction="H2D",
+                    transfer_mode=entry.transfer_mode,
+                    slots=entry.slots,
+                    swa_slots=entry.swa_slots,
+                    waited=(time.perf_counter_ns() - entry.start_ns) / 1e6,
+                )
+                if not success:
+                    loaded[index] = 0
+                    leader_failed = 1
         if self._sync_ctx.needs_sync:
-            self._sync_ctx.barrier()
-        return n
+            # Every rank must enter this collective the same number of times.
+            # Only the sync leader has a verdict (it alone talks to
+            # kv_manager.wait). Followers abstain with 1 so that MIN returns
+            # exactly the leader's 0/1 verdict. Reporting 0 on followers would
+            # make MIN always 0 and hide a leader-side failure, letting the
+            # other ranks run a forward on slots that were never proven loaded.
+            verdict = leader_failed if self._sync_ctx.is_sync_leader else 1
+            failed = self._sync_ctx.all_reduce_min(verdict)
+            if failed and not self._sync_ctx.is_sync_leader:
+                loaded = [0] * len(entries)
+        return loaded
 
     def start_load_kv_layerwise(
         self,
@@ -2989,6 +3111,47 @@ class FlexKVConnector:
             )
         if not load_reset_status["ok"]:
             raise RuntimeError(f"[FlexKV] {load_reset_status['error']}")
+
+        # Deferred non-layerwise restores were already launched, so their DMA
+        # may still be writing into slots the caller is about to free. Fence
+        # them here exactly like the layerwise launch list.
+        pending_retrieves = self._pending_retrieves
+        self._pending_retrieves = []
+        if (
+            pending_retrieves
+            and self._sync_ctx.is_sync_leader
+            and self.kv_manager is not None
+        ):
+            task_ids = [entry.task_id for entry in pending_retrieves]
+            try:
+                responses = (
+                    self.kv_manager.wait(task_ids, timeout=30.0, completely=True) or {}
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"[FlexKV] draining deferred restores during reset failed: {exc}"
+                ) from exc
+            failed = [
+                task_id
+                for task_id in task_ids
+                if task_id not in responses
+                or responses[task_id].status != KVResponseStatus.SUCCESS
+            ]
+            for entry in pending_retrieves:
+                self._log_cache_op(
+                    entry.context,
+                    "complete",
+                    _status_value(responses.get(entry.task_id)),
+                    start_ns=entry.start_ns,
+                    direction="H2D",
+                    transfer_mode=entry.transfer_mode,
+                    slots=entry.slots,
+                    source="reset",
+                )
+            if failed:
+                raise RuntimeError(
+                    f"[FlexKV] deferred restores still running at reset: {failed}"
+                )
 
         # Drop pending lookups (cancel their held tasks on the leader).
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:

@@ -839,6 +839,17 @@ class TransferWorkerBase(ABC):
                             f"for op {op.transfer_op_id}: {e}",
                             exc_info=True,
                         )
+                # The pipe drain is the batch boundary: submit any layerwise
+                # ops collected for a merged (per-layer ordered) submission.
+                # No-op on workers that do not implement the merge path.
+                flush = getattr(self, "flush_layerwise_group", None)
+                if flush is not None:
+                    try:
+                        flush()
+                    except Exception as e:  # noqa: BLE001
+                        flexkv_logger.error(
+                            f"[worker {self.worker_id}] layerwise group flush "
+                            f"failed: {e}", exc_info=True)
                 if drain_failed:
                     flexkv_logger.error(
                         f"[worker {self.worker_id}] transfer pipe unusable "
