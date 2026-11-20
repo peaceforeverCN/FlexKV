@@ -11,6 +11,7 @@ from typing import List, Union
 import torch
 from torch.multiprocessing import Queue as MPQueue
 
+from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 from flexkv.transfer.backends import StorageBackend
@@ -61,7 +62,14 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         )
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.cpu_blocks = cpu_blocks
-        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        # Same gate as the op buffer above, for the same reason: this edge is
+        # CPU<->remote, so a backend that never feeds CUDA must not pin here
+        # either. Pinning calls cudaHostAlloc, and this worker never binds a
+        # device, so that lands a primary context on GPU0 (~338 MiB) and
+        # charges it to whichever rank shares that GPU -- while every consumer
+        # of these pointers only reads them back with ``.item()``.
+        self.cpu_layer_ptrs = self._get_layer_ptrs(
+            cpu_blocks, pin=backend.needs_pinned_block_ids)
         self.cpu_kv_layout = cpu_kv_layout
         self.dtype = dtype
 
@@ -74,6 +82,22 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         )
 
         self._attach_backend(backend, self._build_geometry(cpu_kv_layout, dtype))
+
+        # A CUDA-free backend must leave this process entirely off the GPU: any
+        # pinned host allocation here calls cudaHostAlloc and, since this worker
+        # never binds a device, lands a primary context on GPU0 (~338 MiB)
+        # charged to whichever rank shares that GPU, pushing its allocator into
+        # map/unmap thrash. Assert the invariant directly -- note that
+        # ``torch.cuda.is_initialized()`` stays False in that case, because the
+        # caching host allocator bypasses torch's lazy init, so it cannot be
+        # used to detect this. ``is_pinned()`` touches no CUDA state.
+        if not backend.needs_pinned_block_ids and self.cpu_layer_ptrs.is_pinned():
+            flexkv_logger.warning(
+                "[worker %s] backend %s needs no CUDA, but cpu_layer_ptrs is "
+                "pinned: this process is holding ~338 MiB on GPU0. Look for a "
+                "stray pin_memory/.cuda() call on this worker's init path.",
+                self.worker_id, backend.name,
+            )
 
     def _build_geometry(
         self, cpu_kv_layout: KVCacheLayout, dtype: torch.dtype

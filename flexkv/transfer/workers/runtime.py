@@ -316,14 +316,25 @@ class TransferWorkerBase(ABC):
             cls._worker_id_counter += 1
             return worker_id
 
-    def _get_layer_ptrs(self, layer_blocks: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    def _get_layer_ptrs(self,
+                        layer_blocks: Union[List[torch.Tensor], torch.Tensor],
+                        pin: bool = True) -> torch.Tensor:
+        """Base pointers of each layer's CPU blocks, as host-readable int64.
+
+        ``pin`` mirrors ``get_transfer_block_ids(pinned=...)``: pinning costs a
+        ``cudaHostAlloc``, and in a worker that has not bound a device that call
+        creates a primary context on GPU0 -- ~338 MiB of device memory charged
+        to whichever rank shares that GPU, for a tensor every consumer only ever
+        reads back with ``.item()``. A worker whose backend never feeds CUDA
+        must pass ``pin=False`` so it stays entirely off the GPU.
+        """
         if isinstance(layer_blocks, torch.Tensor):
             layer_blocks = [layer_blocks]
         layer_ptrs = torch.zeros(
             len(layer_blocks),
             dtype=torch.int64,
             device="cpu",
-            pin_memory=True,
+            pin_memory=pin,
         )
         for lay_id in range(len(layer_blocks)):
             layer_ptrs[lay_id] = layer_blocks[lay_id][0].data_ptr()
