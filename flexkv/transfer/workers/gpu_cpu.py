@@ -7,6 +7,7 @@ delivery is a completion contract on this worker, not a separate class.
 """
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
@@ -29,6 +30,7 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 from flexkv.transfer.completion import CompletionContract
+from flexkv.transfer.cuda_sync import synchronize_cuda_devices
 from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
     NullCompressionStrategy,
@@ -53,6 +55,7 @@ from flexkv.transfer.workers.runtime import TransferWorkerBase
 # on every submit. Never read: a plan is only handed to cpp after every
 # request's two tensors have been overwritten with the op's own.
 _EMPTY_BLOCK_IDS = torch.empty(0, dtype=torch.int64)
+_FAILED_TRANSFER_DRAIN_TIMEOUT_S = 30.0
 
 
 class LayerwiseRequests(NamedTuple):
@@ -1753,6 +1756,63 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 post_tokens(n)
             for op in ops:
                 self._report_layerwise_result(op.transfer_op_id, False)
+
+    def _drain_failed_transfer(self) -> bool:
+        """Fence every launch surface before a failed op can release its pins."""
+        targets = []
+        for target in (
+            getattr(self, "region_batch", None),
+            getattr(self, "tp_transfer_thread_group", None),
+        ):
+            if target is not None:
+                targets.append(target)
+        for pool in getattr(self, "_pools", {}).values():
+            targets.extend(group["tp_thread_group"] for group in pool.thread_groups)
+        errors = []
+        devices = sorted(set(getattr(self, "_device_ids", ())) | set(
+            getattr(self, "_cuda_device_ids", ()),
+        ))
+        deadline = time.monotonic() + _FAILED_TRANSFER_DRAIN_TIMEOUT_S
+        done = threading.Event()
+        result = [False]
+
+        def drain() -> None:
+            try:
+                seen = set()
+                for target in targets:
+                    if id(target) in seen:
+                        continue
+                    seen.add(id(target))
+                    try:
+                        target.wait_all_streams()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc))
+                remaining = max(0.0, deadline - time.monotonic())
+                result[0] = (
+                    bool(devices) and remaining > 0 and torch.cuda.is_initialized()
+                    and synchronize_cuda_devices(devices, remaining, name="flexkv-worker-failure")
+                )
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(str(exc))
+            finally:
+                done.set()
+
+        thread = threading.Thread(
+            target=drain, name=f"flexkv-worker-{self.worker_id}-failure-fence", daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            done.set()
+        finished = done.wait(timeout=max(0.0, deadline - time.monotonic()))
+        if not finished or errors or not result[0]:
+            flexkv_logger.error(
+                "[worker %s] failed-transfer CUDA fence incomplete: %s",
+                self.worker_id, errors or "stream/device drain timed out or failed",
+            )
+            return False
+        return True
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):

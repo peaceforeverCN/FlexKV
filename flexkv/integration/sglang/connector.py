@@ -159,6 +159,9 @@ class _PendingRetrieve:
     slots: int
     swa_slots: int
     transfer_mode: str
+    completely: bool = False
+    launch_confirmed: bool = True
+    terminal_status: Optional[str] = None
 
 
 @dataclass
@@ -624,10 +627,10 @@ class FlexKVConnector:
         # _flush_layerwise_launch_batch for why the deferral is what makes
         # layerwise transfer actually layerwise.
         self._pending_layerwise_launch: List[_PendingLayerwiseLaunch] = []
-        # Leader-only: non-layerwise restores whose launch went out but whose
-        # completion is not awaited yet. Only used when the caller opted into
-        # the deferred handoff; otherwise retrieve_kv stays synchronous.
+        # All ranks mirror outstanding non-layerwise restores. Ordinary
+        # deferred restores belong to the open batch; staged restores do not.
         self._pending_retrieves: List[_PendingRetrieve] = []
+        self._staged_retrieves: Dict[str, _PendingRetrieve] = {}
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
@@ -1231,8 +1234,153 @@ class FlexKVConnector:
             return self.retrieve_kv(rid, slot_mapping) > 0
         return self._post_retrieve(rid, slot_mapping) is not None
 
+    def stage_retrieve(self, rid: str, slot_mapping: torch.Tensor) -> bool:
+        """Launch a lookahead restore independently of ``defer_retrieve_wait``.
+
+        Every rank calls this with the same request. Destination ownership must
+        remain live after any exception, until reset proves a complete drain.
+        """
+        staged = getattr(self, "_staged_retrieves", {})
+        self._staged_retrieves = staged
+        manifest = {
+            "rid": rid, "task_id": self._pending_lookups.get(rid, -1),
+            "duplicate": rid in staged,
+        }
+        if self._sync_ctx.needs_sync:
+            manifest = self._sync_ctx.scatter(
+                manifest, channel=FlexKVScatterChannel.LOOKUP,
+            )
+        local_ok = int(
+            manifest["rid"] == rid
+            and manifest["task_id"] == self._pending_lookups.get(rid, -1)
+            and manifest["duplicate"] == (rid in staged)
+        )
+        if self._sync_ctx.needs_sync:
+            local_ok = self._sync_ctx.all_reduce_min(local_ok)
+        if not local_ok or manifest["duplicate"]:
+            raise RuntimeError("FlexKV staged restore admission differs across ranks or is duplicated")
+        return self._post_retrieve(rid, slot_mapping, staged=True) is not None
+
+    def adopt_staged_retrieve(self, rid: str) -> bool:
+        """Move an outstanding lookahead restore into the batch-seal wait."""
+        entry = getattr(self, "_staged_retrieves", {}).pop(rid, None)
+        if entry is None:
+            return False
+        self._pending_retrieves.append(entry)
+        return True
+
+    def poll_staged_retrieves(self, rids: Sequence[str]) -> Dict[str, bool]:
+        """Return only completely drained restores, with one leader verdict.
+
+        A returned SUCCESS relinquishes task ownership, not the caller's slot
+        lease. TIMEOUT and absent responses remain staged. FAILED/CANCELLED
+        return False only for non-layerwise server-client restores; other
+        deployments and NOTFOUND/UNREADY fail closed. Server and clients must
+        be upgraded together and GPUCPU workers restarted with the failure
+        fence hook: a client-side mode flag cannot upgrade a running server.
+        """
+        staged = getattr(self, "_staged_retrieves", {})
+        entries = self._retrieve_manifest(
+            [staged[rid] for rid in dict.fromkeys(rids) if rid in staged],
+            staged, channel=FlexKVScatterChannel.LOOKUP,
+        )
+        statuses = self._wait_complete_retrieves(entries, timeout=0.0)
+        completed = {}
+        for entry in entries:
+            status = statuses.get(entry.rid)
+            if status in {"success", "failed", "cancelled"}:
+                completed[entry.rid] = status == "success"
+                del staged[entry.rid]
+        return completed
+
+    def _retrieve_manifest(
+        self, entries: List[_PendingRetrieve], owned: Dict[str, _PendingRetrieve],
+        *, channel: FlexKVScatterChannel, blocking: bool = False, require_all: bool = False,
+    ) -> List[_PendingRetrieve]:
+        manifest = {"entries": [(entry.rid, entry.task_id) for entry in entries]}
+        if self._sync_ctx.needs_sync:
+            manifest = self._sync_ctx.scatter(manifest, channel=channel, blocking=blocking)
+        local_ok = int(all(
+            rid in owned and owned[rid].task_id == task_id
+            for rid, task_id in manifest["entries"]
+        ) and (not require_all or set(owned) == {rid for rid, _ in manifest["entries"]}))
+        if self._sync_ctx.needs_sync:
+            local_ok = self._sync_ctx.all_reduce_min(local_ok)
+        if not local_ok:
+            raise RuntimeError("FlexKV staged restore ownership differs across ranks; retain GPU slots")
+        return [owned[rid] for rid, _ in manifest["entries"]]
+
+    def _wait_complete_retrieves(
+        self, entries: List[_PendingRetrieve], *, timeout: float,
+        channel: FlexKVScatterChannel = FlexKVScatterChannel.LOOKUP,
+        blocking: bool = False,
+    ) -> Dict[str, str]:
+        """Share complete-drain proofs before any rank can retire ownership."""
+        payload = {"statuses": {}, "error": ""}
+        previously_complete = {entry.rid for entry in entries if entry.terminal_status is not None}
+        leader_error = None
+        if self._sync_ctx.is_sync_leader:
+            try:
+                pending = [entry for entry in entries if entry.terminal_status is None]
+                if pending and self.kv_manager is None:
+                    raise RuntimeError("FlexKV restore manager is unavailable; retain GPU slots")
+                responses = (
+                    self.kv_manager.wait(
+                        [entry.task_id for entry in pending], timeout=timeout, completely=True,
+                    ) or {}
+                ) if pending else {}
+                unsafe = []
+                for entry in entries:
+                    status = entry.terminal_status or _status_value(responses.get(entry.task_id))
+                    failure_fenced = (
+                        entry.transfer_mode == "no-layerwise"
+                        and self.enable_layerwise is False
+                        and self.kv_manager.server_client_mode is True
+                    ) if status in {"failed", "cancelled"} else False
+                    if status == "success" or failure_fenced:
+                        entry.terminal_status = status
+                        payload["statuses"][entry.rid] = status
+                    elif status not in {"missing", "timeout"}:
+                        unsafe.append((entry.rid, status))
+                if unsafe:
+                    raise RuntimeError(f"FlexKV restore drain unproven: {unsafe}; retain GPU slots")
+            except Exception as exc:  # noqa: BLE001
+                leader_error = exc
+                payload["error"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter(payload, channel=channel, blocking=blocking)
+        for entry in entries:
+            status = payload["statuses"].get(entry.rid)
+            if status is not None:
+                entry.terminal_status = status
+                if self._sync_ctx.is_sync_leader and entry.rid not in previously_complete:
+                    self._log_cache_op(
+                        entry.context, "complete", status, start_ns=entry.start_ns,
+                        direction="H2D", transfer_mode=entry.transfer_mode,
+                        slots=entry.slots, swa_slots=entry.swa_slots,
+                    )
+        if payload["error"]:
+            if leader_error is not None:
+                raise leader_error
+            raise RuntimeError("FlexKV restore drain failed: " + payload["error"])
+        return payload["statuses"]
+
+    def _drain_staged_retrieves(self) -> None:
+        staged = getattr(self, "_staged_retrieves", {})
+        entries = self._retrieve_manifest(
+            list(staged.values()), staged, channel=FlexKVScatterChannel.RESET,
+            blocking=True, require_all=True,
+        )
+        statuses = self._wait_complete_retrieves(
+            entries, timeout=30.0, channel=FlexKVScatterChannel.RESET, blocking=True,
+        )
+        if len(statuses) != len(entries):
+            raise RuntimeError("FlexKV staged restores still running during reset; retain GPU slots")
+        for entry in entries:
+            del staged[entry.rid]
+
     def _post_retrieve(
-        self, rid: str, slot_mapping: torch.Tensor
+        self, rid: str, slot_mapping: torch.Tensor, *, staged: bool = False,
     ) -> Optional[_PendingRetrieve]:
         """Issue ``launch`` for one restore and describe the outstanding copy."""
         fkv_task_id = self._pending_lookups.pop(rid, -1)
@@ -1243,25 +1391,34 @@ class FlexKVConnector:
         )
         load_start_ns = time.perf_counter_ns()
 
-        slot_mapping_cpu, swa_slot_mapping = self._restore_slot_mappings(slot_mapping)
-        swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
-
-        # Cross-node PP receivers must send their slot mapping back to
-        # the TransferManagerOnRemote so the remote side knows where to
-        # land the H2D copies on its own GPUs.
-        if self._sync_ctx.should_send_slot_mapping_to_remote:
-            self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu, swa_slot_mapping)
-
-        n = slot_mapping_cpu.numel()
         entry = _PendingRetrieve(
-            rid=rid,
-            task_id=fkv_task_id,
-            context=context,
-            start_ns=load_start_ns,
-            slots=n,
-            swa_slots=swa_slots,
-            transfer_mode="no-layerwise",
+            rid=rid, task_id=fkv_task_id, context=context,
+            start_ns=load_start_ns, slots=int(slot_mapping.numel()), swa_slots=0,
+            transfer_mode="no-layerwise", completely=staged,
+            launch_confirmed=not staged,
         )
+        if staged:
+            self._staged_retrieves[rid] = entry
+        mapping_error = None
+        try:
+            slot_mapping_cpu, swa_slot_mapping = self._restore_slot_mappings(slot_mapping)
+            entry.swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
+            if self._sync_ctx.should_send_slot_mapping_to_remote:
+                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu, swa_slot_mapping)
+        except Exception as exc:  # noqa: BLE001
+            if not staged:
+                raise
+            mapping_error = exc
+        if staged:
+            mappings_ok = int(mapping_error is None)
+            if self._sync_ctx.needs_sync:
+                mappings_ok = self._sync_ctx.all_reduce_min(mappings_ok)
+            if not mappings_ok:
+                raise RuntimeError("FlexKV staged restore mapping failed; retain GPU slots") from mapping_error
+        n, swa_slots = entry.slots, entry.swa_slots
+        launch_error = None
+        if self._sync_ctx.is_sync_leader and self.kv_manager is None and staged:
+            launch_error = RuntimeError("FlexKV staged restore manager is unavailable")
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 self.kv_manager.launch(
@@ -1282,17 +1439,26 @@ class FlexKVConnector:
                     stage="launch",
                     error=str(exc),
                 )
-                raise
-            self._log_cache_op(
-                context,
-                "launch",
-                "running",
-                direction="H2D",
-                transfer_mode="no-layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-            )
-        if self.defer_retrieve_wait:
+                if not staged:
+                    raise
+                launch_error = exc
+            if launch_error is None:
+                self._log_cache_op(
+                    context, "launch", "running", direction="H2D",
+                    transfer_mode="no-layerwise", slots=n, swa_slots=swa_slots,
+                )
+        if staged:
+            launch_status = {"error": str(launch_error) if launch_error is not None else ""}
+            if self._sync_ctx.needs_sync:
+                launch_status = self._sync_ctx.scatter(
+                    launch_status, channel=FlexKVScatterChannel.LOOKUP,
+                )
+            if launch_status["error"]:
+                if launch_error is not None:
+                    raise launch_error
+                raise RuntimeError("FlexKV staged restore launch failed: " + launch_status["error"])
+            entry.launch_confirmed = True
+        elif self.defer_retrieve_wait:
             self._pending_retrieves.append(entry)
         return entry
 
@@ -1313,8 +1479,8 @@ class FlexKVConnector:
         if not self._pending_retrieves:
             return 0
         entries = self._pending_retrieves
-        self._pending_retrieves = []
         results = self._settle_retrieves(entries)
+        self._pending_retrieves = []
         return sum(1 for loaded, entry in zip(results, entries) if loaded < entry.slots)
 
     def _settle_retrieves(self, entries: List[_PendingRetrieve]) -> List[int]:
@@ -1324,6 +1490,15 @@ class FlexKVConnector:
         through the same collective the sync path used, so every rank agrees on
         what was loaded before the forward reads those slots.
         """
+        if any(entry.completely for entry in entries):
+            entries = self._retrieve_manifest(
+                entries, {entry.rid: entry for entry in entries},
+                channel=FlexKVScatterChannel.LOOKUP, require_all=True,
+            )
+            statuses = self._wait_complete_retrieves(entries, timeout=30.0)
+            if len(statuses) != len(entries):
+                raise RuntimeError("FlexKV adopted restores still running at batch seal; retain GPU slots")
+            return [entry.slots if statuses[entry.rid] == "success" else 0 for entry in entries]
         task_ids = [entry.task_id for entry in entries]
         loaded: List[int] = [entry.slots for entry in entries]
         leader_failed = 0
@@ -3026,6 +3201,7 @@ class FlexKVConnector:
         self._pending_store_batch = None
 
     def reset(self) -> None:
+        self._drain_staged_retrieves()
         self._drain_pending_store_batch()
         # A deferred batch holds registered transfers that the counter is
         # already waiting for. Launch it before the drain below, or the wait
@@ -3115,43 +3291,17 @@ class FlexKVConnector:
         # Deferred non-layerwise restores were already launched, so their DMA
         # may still be writing into slots the caller is about to free. Fence
         # them here exactly like the layerwise launch list.
-        pending_retrieves = self._pending_retrieves
+        pending_retrieves = getattr(self, "_pending_retrieves", [])
+        pending_retrieves = self._retrieve_manifest(
+            pending_retrieves, {entry.rid: entry for entry in pending_retrieves},
+            channel=FlexKVScatterChannel.RESET, blocking=True, require_all=True,
+        )
+        statuses = self._wait_complete_retrieves(
+            pending_retrieves, timeout=30.0, channel=FlexKVScatterChannel.RESET, blocking=True,
+        )
+        if len(statuses) != len(pending_retrieves):
+            raise RuntimeError("[FlexKV] deferred restores still running at reset; retain GPU slots")
         self._pending_retrieves = []
-        if (
-            pending_retrieves
-            and self._sync_ctx.is_sync_leader
-            and self.kv_manager is not None
-        ):
-            task_ids = [entry.task_id for entry in pending_retrieves]
-            try:
-                responses = (
-                    self.kv_manager.wait(task_ids, timeout=30.0, completely=True) or {}
-                )
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    f"[FlexKV] draining deferred restores during reset failed: {exc}"
-                ) from exc
-            failed = [
-                task_id
-                for task_id in task_ids
-                if task_id not in responses
-                or responses[task_id].status != KVResponseStatus.SUCCESS
-            ]
-            for entry in pending_retrieves:
-                self._log_cache_op(
-                    entry.context,
-                    "complete",
-                    _status_value(responses.get(entry.task_id)),
-                    start_ns=entry.start_ns,
-                    direction="H2D",
-                    transfer_mode=entry.transfer_mode,
-                    slots=entry.slots,
-                    source="reset",
-                )
-            if failed:
-                raise RuntimeError(
-                    f"[FlexKV] deferred restores still running at reset: {failed}"
-                )
 
         # Drop pending lookups (cancel their held tasks on the leader).
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:

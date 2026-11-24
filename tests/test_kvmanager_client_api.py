@@ -11,8 +11,11 @@ Each test drives the real ``KVManager`` method against an autospecced
 backend, which raises AttributeError for any method the real class does not
 define.  That is what makes this catch a rename rather than restating one.
 """
-from unittest.mock import create_autospec
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock, create_autospec
 
+import numpy as np
 import pytest
 
 from flexkv.kvmanager import KVManager
@@ -120,3 +123,47 @@ def test_shutdown_reaches_backend(server_client_mode, server_launch_mode):
         manager.dp_client.unregister.assert_called_once_with()
     else:
         manager.dp_client.shutdown.assert_called_once_with()
+
+
+def _rpc_client():
+    client = KVDPClient.__new__(KVDPClient)
+    client.dp_client_id = 0
+    client._rpc_lock = threading.Lock()
+    client._get_task_id = MagicMock(return_value=99)
+    client.send_to_server = MagicMock()
+    client.recv_from_server = MagicMock()
+    return client
+
+
+@pytest.mark.parametrize("confirm_launch", [False, True])
+def test_dp_launch_confirmation_only_controls_acknowledgement(confirm_launch):
+    client = _rpc_client()
+    client.recv_from_server.recv_pyobj.return_value = SimpleNamespace(error_msg="")
+    slots = np.arange(4, dtype=np.int64)
+
+    assert client.launch_tasks(
+        [7], [slots], as_batch=True,
+        layerwise_transfer=False, confirm_launch=confirm_launch,
+    ) == [99]
+
+    request = client.send_to_server.send_pyobj.call_args.args[0]
+    assert request.task_ids == [7]
+    assert request.confirm_launch is confirm_launch
+    assert request.layerwise_transfer is False
+    if confirm_launch:
+        client.recv_from_server.recv_pyobj.assert_called_once_with()
+    else:
+        client.recv_from_server.recv_pyobj.assert_not_called()
+
+
+def test_dp_zero_timeout_complete_poll_still_receives_a_control_reply():
+    client = _rpc_client()
+    client.recv_from_server.recv_pyobj.return_value = SimpleNamespace(status={})
+
+    assert client.wait([7], wait_timeout=0.0, completely=True) == {}
+
+    request = client.send_to_server.send_pyobj.call_args.args[0]
+    assert request.wait_task_ids == [7]
+    assert request.wait_timeout == 0.0
+    assert request.completely is True
+    client.recv_from_server.recv_pyobj.assert_called_once_with()

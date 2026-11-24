@@ -133,11 +133,13 @@ def _connector(manager, *, leader=True, scatter=None):
         "_prefetch_loaded_tokens", "_prefetch_loaded_spans", "_pending_lookups",
         "_pending_lookup_contexts", "_prefetch_contexts", "_ongoing_prefetches",
         "_prefetch_planned_tokens", "_inflight_loads", "_launched_load_contexts",
-        "_inflight_stores", "_inflight_store_contexts",
+        "_inflight_stores", "_inflight_store_contexts", "_staged_retrieves",
     ):
         setattr(connector, name, {})
     connector._completed_layerwise = []
     connector._launched_load_tids = []
+    connector._pending_layerwise_launch = []
+    connector._pending_retrieves = []
     connector.layer_done_counter = None
     connector._new_op_context = Mock(side_effect=lambda *a, **kw: SimpleNamespace(
         task_id=-1, operation="lookup",

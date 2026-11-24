@@ -245,6 +245,38 @@ def test_d2h_writes_the_same_cpu_bytes_as_the_per_group_path(
     del group
 
 
+@pytest.mark.parametrize("use_ce", [False, True], ids=["cuda", "ce"])
+def test_async_h2d_submit_with_explicit_drain_restores_full_and_indexer(use_ce):
+    regions = build_regions(2, "BLOCKFIRST", NUM_GPUS)
+    before = [region.snapshot_gpu() for region in regions]
+    group = batched(regions, True, NUM_GPUS)
+    ids = block_ids(NUM_BLOCKS)
+    group.submit(
+        make_requests(len(regions), ids, ids, False,
+                      transfer_num_cta=4, use_ce_transfer=use_ce),
+        True,
+    )
+    for region in regions:
+        region.zero_gpu()
+    sync_all(NUM_GPUS)
+
+    group.submit(
+        make_requests(len(regions), ids, ids, True,
+                      transfer_num_cta=4, use_ce_transfer=use_ce),
+        False,
+    )
+    group.wait_all_streams()
+
+    for ri, region in enumerate(regions):
+        for rank in range(NUM_GPUS):
+            for layer in range(region.num_layers):
+                assert torch.equal(
+                    region.per_rank[rank][layer].detach().cpu(),
+                    before[ri][rank][layer],
+                )
+    del group
+
+
 @pytest.mark.parametrize("cpu_layout_name", ["LAYERFIRST", "BLOCKFIRST"])
 @pytest.mark.parametrize("use_ce", [False, True], ids=["cuda", "ce"])
 def test_roundtrip_through_the_batch_restores_every_regions_gpu_data(

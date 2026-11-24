@@ -34,6 +34,9 @@ def _follower_connector(payload):
     )
     connector._inflight_stores = {}
     connector._inflight_store_contexts = {}
+    connector._pending_layerwise_launch = []
+    connector._pending_retrieves = []
+    connector._staged_retrieves = {}
     connector._new_op_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
     connector._log_cache_op = MagicMock()
     return connector
@@ -411,7 +414,11 @@ def test_wait_store_keeps_tracking_until_fully_drained():
 def test_store_reset_waits_for_leader_drain_on_follower():
     connector = _follower_connector(None)
     connector._sync_ctx.scatter.side_effect = [
+        {"entries": []},
+        {"statuses": {}, "error": ""},
         {"ok": True, "error": ""},
+        {"entries": []},
+        {"statuses": {}, "error": ""},
         {"ok": True, "error": ""},
     ]
     connector._launched_load_tids = []
@@ -428,7 +435,7 @@ def test_store_reset_waits_for_leader_drain_on_follower():
 
     connector.reset()
 
-    assert connector._sync_ctx.scatter.call_args_list[1].kwargs == {
+    assert connector._sync_ctx.scatter.call_args_list[-1].kwargs == {
         "channel": FlexKVScatterChannel.STORE_RESET,
         "blocking": True,
     }

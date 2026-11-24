@@ -143,6 +143,7 @@ class TransferWorkerBase(ABC):
         # (tensor, label) pairs registered via _register_host_tensor / _pin_op_buffer.
         self._host_registered: List[Tuple[torch.Tensor, str]] = []
         self._shutdown_done = False
+        self._undrained_transfer_failures: Dict[int, Tuple[Any, Any]] = {}
         # Pluggable I/O engine for this worker's edge; None = the worker's own
         # native ``_transfer_impl``. See flexkv/transfer/backends.py.
         self._backend: Optional[StorageBackend] = None
@@ -176,6 +177,34 @@ class TransferWorkerBase(ABC):
         if not self._op_buffer_pinned:
             self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
             self._op_buffer_pinned = True
+
+    def _drain_failed_transfer(self) -> bool:
+        """Whether an exceptional launch is safe to report as terminal.
+
+        Synchronous CPU backends keep their existing contract. CUDA workers
+        override this hook: a partial launch must be fenced before rollback.
+        """
+        return True
+
+    def _failed_transfer_result(self, op: WorkerTransferOp, error: Exception) -> Any:
+        failures = getattr(self, "_undrained_transfer_failures", {})
+        self._undrained_transfer_failures = failures
+        failures[op.transfer_op_id] = (op, error)
+        drain_error = None
+        try:
+            drained = self._drain_failed_transfer()
+        except Exception as exc:  # noqa: BLE001
+            drained = False
+            drain_error = exc
+        if drained:
+            del failures[op.transfer_op_id]
+            return False
+        failures[op.transfer_op_id] = (op, error if drain_error is None else (error, drain_error))
+        flexkv_logger.error(
+            "[worker %s] CUDA drain unproven for op %s; retaining ownership without terminal completion",
+            self.worker_id, op.transfer_op_id,
+        )
+        return DEFERRED_COMPLETION
 
     def has_deferred_completions(self) -> bool:
         """Are there ops this worker launched but has not yet reported?
@@ -763,8 +792,14 @@ class TransferWorkerBase(ABC):
                                             f"graph_id: {op.transfer_graph_id}",
                                             color=get_nvtx_range_color(op.transfer_graph_id))
                         nvtx_pushed = True
-                        transfer_status = self.launch_transfer(op)
+                        failures = getattr(self, "_undrained_transfer_failures", {})
+                        if failures:
+                            failures.setdefault(op.transfer_op_id, (op, "worker drain remains unproven"))
+                            transfer_status = DEFERRED_COMPLETION
+                        else:
+                            transfer_status = self.launch_transfer(op)
                     except Exception as e:
+                        transfer_status = self._failed_transfer_result(op, e)
                         is_layerwise = op.transfer_type == TransferType.LAYERWISE
                         direction = "H2D" if is_layerwise else op.transfer_type.value
                         blocks = (
