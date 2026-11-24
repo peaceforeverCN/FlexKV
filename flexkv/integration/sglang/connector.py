@@ -1229,7 +1229,11 @@ class FlexKVConnector:
         """
         if not self.defer_retrieve_wait:
             return self.retrieve_kv(rid, slot_mapping) > 0
-        return self._post_retrieve(rid, slot_mapping) is not None
+        entry = self._post_retrieve(rid, slot_mapping)
+        if entry is None:
+            return False
+        self._pending_retrieves.append(entry)
+        return True
 
     def _post_retrieve(
         self, rid: str, slot_mapping: torch.Tensor
@@ -1292,8 +1296,6 @@ class FlexKVConnector:
                 slots=n,
                 swa_slots=swa_slots,
             )
-        if self.defer_retrieve_wait:
-            self._pending_retrieves.append(entry)
         return entry
 
     def flush_pending_retrieves(self) -> int:

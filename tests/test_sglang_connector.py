@@ -207,3 +207,80 @@ def test_restore_mappings_land_in_pinned_memory_on_one_host_wait():
     assert torch.equal(full, torch.arange(100, 108, dtype=torch.int64))
     assert torch.equal(swa, torch.tensor([3, 4], dtype=torch.int64))
     assert swa.numel() * swa.element_size() == swa.untyped_storage().nbytes()
+
+
+def _retrieve_connector(defer_wait):
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.defer_retrieve_wait = defer_wait
+    connector._pending_lookups = {"r": 7}
+    connector._pending_retrieves = []
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True, needs_sync=False,
+        should_send_slot_mapping_to_remote=False,
+    )
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.wait.return_value = {
+        7: SimpleNamespace(status=connector_module.KVResponseStatus.SUCCESS)
+    }
+    connector._pop_context = MagicMock()
+    connector._restore_slot_mappings = MagicMock(
+        side_effect=lambda slots: (slots, None)
+    )
+    connector._log_cache_op = MagicMock()
+    return connector
+
+
+@pytest.mark.parametrize("defer_wait", [False, True])
+def test_synchronous_retrieve_does_not_leave_deferred_entries(defer_wait):
+    connector = _retrieve_connector(defer_wait)
+
+    assert connector.retrieve_kv("r", torch.arange(4)) == 4
+    assert connector._pending_retrieves == []
+    assert connector.flush_pending_retrieves() == 0
+    connector.kv_manager.wait.assert_called_once_with([7], timeout=30.0)
+    assert connector._pending_lookups == {}
+
+
+@pytest.mark.parametrize("defer_wait", [False, True])
+def test_retrieve_launch_waits_once_at_the_selected_handoff(defer_wait):
+    connector = _retrieve_connector(defer_wait)
+
+    assert connector.retrieve_kv_launch("r", torch.arange(4))
+    if defer_wait:
+        connector.kv_manager.wait.assert_not_called()
+        assert [e.task_id for e in connector._pending_retrieves] == [7]
+    else:
+        connector.kv_manager.wait.assert_called_once_with([7], timeout=30.0)
+        assert connector._pending_retrieves == []
+
+    assert connector.flush_pending_retrieves() == 0
+    assert connector._pending_retrieves == []
+    assert connector.flush_pending_retrieves() == 0
+    connector.kv_manager.wait.assert_called_once_with([7], timeout=30.0)
+
+
+def test_retrieve_launch_without_a_lookup_does_not_add_a_deferred_entry():
+    connector = _retrieve_connector(True)
+    connector._pending_lookups.clear()
+
+    assert not connector.retrieve_kv_launch("r", torch.arange(4))
+    assert connector._pending_retrieves == []
+    connector.kv_manager.launch.assert_not_called()
+    connector.kv_manager.wait.assert_not_called()
+
+
+def test_synchronous_retrieve_preserves_other_deferred_restores():
+    connector = _retrieve_connector(True)
+    connector._pending_lookups["deferred"] = 8
+    connector.kv_manager.wait.return_value[8] = SimpleNamespace(
+        status=connector_module.KVResponseStatus.SUCCESS
+    )
+
+    assert connector.retrieve_kv_launch("deferred", torch.arange(4))
+    assert connector.retrieve_kv("r", torch.arange(4)) == 4
+    assert [e.task_id for e in connector._pending_retrieves] == [8]
+    assert connector.flush_pending_retrieves() == 0
+    assert connector._pending_retrieves == []
+    assert [call.args[0] for call in connector.kv_manager.wait.call_args_list] == [
+        [7], [8]
+    ]
