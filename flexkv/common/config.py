@@ -1122,7 +1122,15 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
 
 def load_user_config_from_env() -> UserConfig:
     swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
+    num_cpu_slots_env = os.getenv('FLEXKV_SWA_NUM_CPU_SLOTS')
+    swa = None
+    if num_cpu_slots_env is not None:
+        num_cpu_slots = int(num_cpu_slots_env)
+        if num_cpu_slots <= 0:
+            raise ValueError(f"FLEXKV_SWA_NUM_CPU_SLOTS must be positive, got {num_cpu_slots}")
+        swa = {'num_cpu_slots': num_cpu_slots}
     return UserConfig(
+        swa=swa,
         enable_chunked_prefetch=bool(int(os.getenv('FLEXKV_ENABLE_CHUNKED_PREFETCH', 0))),
         prefetch_options=json.loads(os.getenv('FLEXKV_PREFETCH_OPTIONS', '{}')),
         prefetch_max_sessions=int(os.getenv('FLEXKV_PREFETCH_MAX_SESSIONS', 128)),
