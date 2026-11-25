@@ -239,6 +239,24 @@ class KVServer:
                       child_env: Optional[dict] = None,
                       inherit_env: bool = True) -> 'KVServerHandle':
 
+        mps_priority = (child_env or {}).get(
+            "FLEXKV_CUDA_MPS_CLIENT_PRIORITY",
+            os.environ.get("FLEXKV_CUDA_MPS_CLIENT_PRIORITY"),
+        )
+        if mps_priority is not None:
+            if mps_priority not in ("0", "1"):
+                raise ValueError(
+                    "FLEXKV_CUDA_MPS_CLIENT_PRIORITY must be 0 (normal) or "
+                    f"1 (below normal), got {mps_priority!r}"
+                )
+            child_env = dict(child_env or {})
+            child_env["CUDA_MPS_CLIENT_PRIORITY"] = mps_priority
+            flexkv_logger.info(
+                "KVServer CUDA_MPS_CLIENT_PRIORITY=%s "
+                "(from FLEXKV_CUDA_MPS_CLIENT_PRIORITY)",
+                mps_priority,
+            )
+
         # Set spawn method for CUDA compatibility
         with contextlib.suppress(RuntimeError):
             mp.set_start_method("spawn")
@@ -256,7 +274,7 @@ class KVServer:
                 if child_env:
                     env.update(child_env)
             else:
-                env = child_env or {}
+                env = dict(child_env or {})
                 # Keep cache and transport settings in the separate owner.
                 # Dropping Mooncake's hugepage settings can allocate its large
                 # segment from ordinary RAM instead of the reserved pool.
